@@ -1,3 +1,9 @@
+<!-- NAVEGAÇÃO DE IDIOMAS -->
+<div align="right">
+  <a href="./README.md"><img src="https://img.shields.io/badge/Português-2E6EEF?style=for-the-badge&logo=github&logoColor=white" alt="Versão em Português"></a>
+  <a href="./README_EN.md"><img src="https://img.shields.io/badge/English-1f2428?style=for-the-badge&logo=github&logoColor=white" alt="English Version"></a>
+</div>
+
 # ✂️ Bella & Chic — Plataforma SaaS de Gestão para Salões e Barbearias
 
 > Sistema multiempresa (multi-tenant) completo para agendamento online, gestão de clientes, controle financeiro e organização de serviços para profissionais da beleza e estética.
@@ -25,6 +31,13 @@ O **Bella & Chic** foi desenvolvido para resolver as dores de agendamento e gest
 
 ---
 
+## 🖥️ Screenshots
+
+![Dashboard e Agendamentos](docs/screenshots/dashboard.png)
+![Gestão de Serviços](docs/screenshots/services.png)
+
+---
+
 ## 💻 Como Executar o Projeto Localmente
 
 ```bash
@@ -39,8 +52,3 @@ npm install
 
 # Iniciar o servidor de desenvolvimento
 npm run dev
-```
-
-
-👤 Autor:
-Desenvolvido por Kevin Bertolini
