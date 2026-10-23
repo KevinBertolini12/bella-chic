@@ -52,3 +52,12 @@ npm install
 
 # Start the development server
 npm run dev
+```
+
+---
+
+
+👤 Author:
+Developed by Kevin Bertolini
+
+
