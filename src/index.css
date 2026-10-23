@@ -1,0 +1,190 @@
+@import "tailwindcss";
+
+@theme {
+  --color-primary: var(--primary);
+  --color-secondary: var(--secondary);
+  --color-accent: var(--accent);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --radius-lg: var(--radius);
+  --font-sans: var(--font-primary), ui-sans-serif, system-ui, sans-serif;
+  --font-serif: var(--font-secondary), ui-serif, Georgia, serif;
+}
+
+:root {
+  --primary: #e11d48;
+  --secondary: #4c1d95;
+  --accent: #f43f5e;
+  --background: #ffffff;
+  --foreground: #0f172a;
+  --radius: 0.5rem;
+  --font-primary: "Inter";
+  --font-secondary: "Inter";
+}
+
+.dark {
+  --background: #0f172a;
+  --foreground: #f8fafc;
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-primary), sans-serif;
+}
+
+/* ─── react-day-picker v9 — tema customizado ─────────────────────────────── */
+.rdp-root {
+  --rdp-accent-color: var(--primary);
+  --rdp-accent-background-color: rgba(225, 29, 72, 0.12);
+  --rdp-today-color: var(--primary);
+  --rdp-day-height: 40px;
+  --rdp-day-width: 40px;
+  --rdp-day_button-height: 36px;
+  --rdp-day_button-width: 36px;
+  --rdp-day_button-border-radius: 8px;
+  --rdp-nav_button-width: 2rem;
+  --rdp-nav_button-height: 2rem;
+  --rdp-nav-height: 2.5rem;
+  --rdp-outside-opacity: 0.35;
+  --rdp-disabled-opacity: 0.3;
+  font-family: var(--font-primary), sans-serif;
+}
+
+/* Faz o calendário ocupar 100% do container */
+.rdp-root,
+.rdp-months,
+.rdp-month,
+.rdp-month_grid {
+  width: 100%;
+}
+
+/* Distribui as colunas dos dias uniformemente */
+.rdp-weekdays,
+.rdp-week {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+}
+
+.rdp-weekday {
+  text-align: center;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: #6b7280;
+  padding: 6px 0;
+  opacity: 1;
+}
+
+.rdp-day {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 40px;
+}
+
+.rdp-day_button {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.15s, color 0.15s;
+  border: none;
+  cursor: pointer;
+  background: none;
+}
+
+.rdp-day_button:hover:not(:disabled) {
+  background-color: #f3f4f6;
+}
+
+.rdp-selected .rdp-day_button {
+  background-color: var(--primary) !important;
+  color: #fff !important;
+  font-weight: 600;
+  border: none !important;
+}
+
+.rdp-today:not(.rdp-selected) .rdp-day_button {
+  background-color: rgba(225, 29, 72, 0.12);
+  color: var(--primary);
+  font-weight: 700;
+}
+
+.rdp-disabled .rdp-day_button {
+  cursor: not-allowed;
+  opacity: 0.3;
+}
+
+.rdp-outside .rdp-day_button {
+  opacity: 0.35;
+}
+
+.rdp-month_caption {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 2.5rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.rdp-nav {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-end: 0;
+  height: 2.5rem;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Botões de navegação */
+.rdp-button_previous,
+.rdp-button_next {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 6px;
+  border: 1px solid #e5e7eb;
+  background: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0.7;
+  transition: opacity 0.15s;
+}
+
+.rdp-button_previous:hover,
+.rdp-button_next:hover {
+  opacity: 1;
+  background: #f9fafb;
+}
+
+/* Esconde o chevron SVG padrão (usamos lucide) */
+.rdp-chevron {
+  display: none;
+}
+
+/* Mobile — células um pouco menores */
+@media (max-width: 480px) {
+  .rdp-root {
+    --rdp-day-height: 36px;
+    --rdp-day-width: 36px;
+    --rdp-day_button-height: 32px;
+    --rdp-day_button-width: 32px;
+  }
+
+  .rdp-weekday {
+    font-size: 0.65rem;
+  }
+
+  .rdp-day_button {
+    width: 32px;
+    height: 32px;
+    font-size: 0.8rem;
+  }
+}
