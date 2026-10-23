@@ -1,0 +1,161 @@
+{
+  "entities": {
+    "Salon": {
+      "title": "Salon",
+      "description": "A salon tenant in the SaaS platform.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "slug": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "planId": { "type": "string" },
+        "status": { "type": "string", "enum": ["TRIAL", "ACTIVE", "EXPIRED", "CANCELLED", "BLOCKED"] },
+        "trialEndsAt": { "type": "number" },
+        "subscriptionId": { "type": "string" },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["id", "name", "slug", "ownerId", "planId", "status"]
+    },
+    "Plan": {
+      "title": "Plan",
+      "description": "Subscription plan definition.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "price": { "type": "number" },
+        "interval": { "type": "string", "enum": ["MONTHLY", "YEARLY"] },
+        "features": { "type": "object" }
+      },
+      "required": ["id", "name", "price", "interval"]
+    },
+    "Subscription": {
+      "title": "Subscription",
+      "description": "Salon subscription details.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "salonId": { "type": "string" },
+        "planId": { "type": "string" },
+        "status": { "type": "string", "enum": ["ACTIVE", "PAST_DUE", "CANCELLED"] },
+        "currentPeriodEnd": { "type": "number" }
+      },
+      "required": ["id", "salonId", "planId", "status"]
+    },
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "User profile information and role.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth UID" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "role": { "type": "string", "enum": ["SUPER_ADMIN", "SALON_ADMIN", "PROFESSIONAL", "CLIENT"] },
+        "salonId": { "type": "string" },
+        "photoURL": { "type": "string", "format": "uri" },
+        "phone": { "type": "string" },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["uid", "email", "role"]
+    },
+    "SalonService": {
+      "title": "Salon Service",
+      "description": "A service offered by the salon.",
+      "type": "object",
+      "properties": {
+        "salonId": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "duration": { "type": "number", "description": "Duration in minutes" },
+        "price": { "type": "number" },
+        "active": { "type": "boolean" },
+        "category": { "type": "string" }
+      },
+      "required": ["salonId", "name", "duration", "price"]
+    },
+    "Professional": {
+      "title": "Professional",
+      "description": "A staff member who provides services.",
+      "type": "object",
+      "properties": {
+        "salonId": { "type": "string" },
+        "userId": { "type": "string" },
+        "displayName": { "type": "string" },
+        "bio": { "type": "string" },
+        "specialties": { "type": "array", "items": { "type": "string" } },
+        "active": { "type": "boolean" },
+        "photoURL": { "type": "string" }
+      },
+      "required": ["salonId", "userId", "displayName"]
+    },
+    "Appointment": {
+      "title": "Appointment",
+      "description": "A scheduled salon service.",
+      "type": "object",
+      "properties": {
+        "salonId": { "type": "string" },
+        "clientId": { "type": "string" },
+        "clientName": { "type": "string" },
+        "professionalId": { "type": "string" },
+        "professionalName": { "type": "string" },
+        "serviceId": { "type": "string" },
+        "serviceName": { "type": "string" },
+        "date": { "type": "string", "format": "date" },
+        "startTime": { "type": "string" },
+        "endTime": { "type": "string" },
+        "status": { "type": "string", "enum": ["PENDING", "CONFIRMED", "COMPLETED", "CANCELLED", "RESCHEDULED"] },
+        "totalAmount": { "type": "number" },
+        "createdAt": { "type": "number" },
+        "notes": { "type": "string" }
+      },
+      "required": ["salonId", "clientId", "professionalId", "serviceId", "date", "startTime", "endTime"]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "A clothing item for sale.",
+      "type": "object",
+      "properties": {
+        "salonId": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "price": { "type": "number" },
+        "promotionalPrice": { "type": "number" },
+        "stock": { "type": "number" },
+        "category": { "type": "string" },
+        "images": { "type": "array", "items": { "type": "string" } },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["salonId", "name", "price", "stock"]
+    },
+    "Order": {
+      "title": "Order",
+      "description": "A purchase of products.",
+      "type": "object",
+      "properties": {
+        "salonId": { "type": "string" },
+        "clientId": { "type": "string" },
+        "items": { "type": "array", "items": { "type": "object" } },
+        "totalAmount": { "type": "number" },
+        "shippingFee": { "type": "number" },
+        "status": { "type": "string", "enum": ["AWAITING_PAYMENT", "PAID", "PREPARING", "SHIPPED", "READY_FOR_PICKUP", "COMPLETED", "CANCELLED"] },
+        "shippingMethod": { "type": "string", "enum": ["FIXED", "PICKUP"] },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["salonId", "clientId", "items", "totalAmount", "status"]
+    }
+  },
+  "firestore": {
+    "/salons/{salonId}": { "schema": "Salon", "description": "Salon tenants" },
+    "/plans/{planId}": { "schema": "Plan", "description": "Subscription plans" },
+    "/subscriptions/{subId}": { "schema": "Subscription", "description": "Subscriptions" },
+    "/users/{uid}": { "schema": "UserProfile", "description": "User profiles" },
+    "/salons/{salonId}/services/{serviceId}": { "schema": "SalonService", "description": "Salon services" },
+    "/salons/{salonId}/professionals/{profId}": { "schema": "Professional", "description": "Salon professionals" },
+    "/salons/{salonId}/appointments/{appId}": { "schema": "Appointment", "description": "Service appointments" },
+    "/salons/{salonId}/products/{productId}": { "schema": "Product", "description": "Clothing products" },
+    "/salons/{salonId}/orders/{orderId}": { "schema": "Order", "description": "Customer orders" },
+    "/salons/{salonId}/settings/{section}": { "schema": "object", "description": "Salon settings" }
+  }
+}

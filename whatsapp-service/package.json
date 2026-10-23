@@ -1,0 +1,18 @@
+{
+  "name": "bella-chic-whatsapp-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serviço Baileys (WhatsApp) do Bella & Chic — porta 8082",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": { "node": ">=20.0.0" },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.18",
+    "axios": "^1.7.9",
+    "express": "^4.21.2",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4"
+  }
+}

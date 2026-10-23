@@ -1,0 +1,9 @@
+{
+  "name": "Bella & Chic SaaS Platform",
+  "description": "Plataforma SaaS completa para gestão de salões de beleza, boutiques e agendamentos com multi-tenancy e cobrança integrada.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}

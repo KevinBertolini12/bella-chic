@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bella & Chic — Sistema de Gestão para Salões e Barbearias</title>
+
+    <!-- PWA -->
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" content="#e11d48" />
+    <meta name="mobile-web-app-capable" content="yes" />
+
+    <!-- iOS PWA -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Bella & Chic" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" sizes="152x152" href="/icons/icon-152.png" />
+    <link rel="apple-touch-icon" sizes="144x144" href="/icons/icon-144.png" />
+
+    <!-- Favicon -->
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="icon" type="image/png" sizes="96x96" href="/icons/icon-96.png" />
+
+    <!-- SEO -->
+    <meta name="description" content="Sistema completo para salões, barbearias, nail designers e estúdios de beleza. Agendamento online 24h, bot WhatsApp com IA, financeiro, CRM e muito mais. 14 dias grátis." />
+    <meta name="keywords" content="sistema para salão, sistema para barbearia, agendamento online salão, gestão barbearia, software salão beleza, agenda online barbeiro" />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="https://bella-chic.duckdns.org" />
+
+    <!-- Open Graph (WhatsApp, Facebook, LinkedIn) -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://bella-chic.duckdns.org" />
+    <meta property="og:site_name" content="Bella & Chic" />
+    <meta property="og:title" content="Bella & Chic — Sistema para Salões e Barbearias" />
+    <meta property="og:description" content="Agendamento online, bot WhatsApp com IA, financeiro completo, CRM e loja virtual. Tudo para seu salão ou barbearia crescer. 14 dias grátis, sem cartão." />
+    <meta property="og:image" content="https://bella-chic.duckdns.org/og-image.jpg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Bella & Chic - Sistema de Gestão para Salões" />
+    <meta property="og:locale" content="pt_BR" />
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Bella & Chic — Sistema para Salões e Barbearias" />
+    <meta name="twitter:description" content="Agendamento online 24h, bot WhatsApp com IA, financeiro, CRM. 14 dias grátis." />
+    <meta name="twitter:image" content="https://bella-chic.duckdns.org/og-image.jpg" />
+
+    <!-- Schema.org (Google) -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "Bella & Chic",
+      "applicationCategory": "BusinessApplication",
+      "operatingSystem": "Web, Android, iOS",
+      "description": "Sistema completo de gestão para salões, barbearias e estúdios de beleza",
+      "offers": {
+        "@type": "Offer",
+        "price": "64.99",
+        "priceCurrency": "BRL"
+      },
+      "url": "https://bella-chic.duckdns.org"
+    }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

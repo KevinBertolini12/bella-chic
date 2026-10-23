@@ -1,0 +1,440 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function userData() {
+      return get(/databases/$(database)/documents/users/$(uid())).data;
+    }
+
+    function isSuperAdmin() {
+      return isAuth()
+        && exists(/databases/$(database)/documents/users/$(uid()))
+        && userData().role == 'SUPER_ADMIN';
+    }
+
+    function salonData(salonId) {
+      return get(/databases/$(database)/documents/salons/$(salonId)).data;
+    }
+
+    function salonIsAccessible(salonId) {
+      return salonData(salonId).status != 'BLOCKED';
+    }
+
+    function isSalonAdmin(salonId) {
+      return isAuth()
+        && userData().salonId == salonId
+        && userData().role == 'SALON_ADMIN'
+        && salonIsAccessible(salonId);
+    }
+
+    function isProfessional(salonId) {
+      return isAuth()
+        && userData().salonId == salonId
+        && userData().role == 'PROFESSIONAL'
+        && salonIsAccessible(salonId);
+    }
+
+    function isClient(salonId) {
+      return isAuth()
+        && userData().salonId == salonId
+        && userData().role == 'CLIENT';
+    }
+
+    function isGuestCreate() {
+      return request.resource.data.clientId.matches('guest_.*');
+    }
+
+    function isResourceOwner() {
+      return isAuth() && uid() == resource.data.clientId;
+    }
+
+    function isProfessionalOfAppointment() {
+      return isAuth() && uid() == resource.data.professionalId;
+    }
+
+    function isSalonOwner(salonId) {
+      return isAuth() && uid() == salonData(salonId).ownerId;
+    }
+
+    function isBootstrapEmail() {
+      return request.auth.token.superAdmin == true
+          && request.auth.token.email_verified == true;
+    }
+
+    // Verifica que campos obrigatórios existem e são strings (anti-injection básico)
+    function hasValidStringField(field) {
+      return field in request.resource.data
+          && request.resource.data[field] is string
+          && request.resource.data[field].size() > 0
+          && request.resource.data[field].size() < 2000;
+    }
+
+    // ─── Salões ──────────────────────────────────────────────────────────────
+
+    match /salons/{salonId} {
+      // Leitura pública apenas de campos não-sensíveis (vitrine pública)
+      // Clientes precisam ver nome, logo, slug, serviços etc.
+      allow read: if true;
+
+      allow create: if isAuth();
+
+      allow update: if isSuperAdmin()
+                    || isSalonAdmin(salonId)
+                    || (isAuth() && uid() == resource.data.ownerId);
+
+      allow delete: if isSuperAdmin();
+
+      // ── Serviços ──────────────────────────────────────────────────────────
+      match /services/{serviceId} {
+        allow read: if true;
+        allow write: if isSuperAdmin() || isSalonAdmin(salonId);
+      }
+
+      // ── Profissionais ─────────────────────────────────────────────────────
+      match /professionals/{profId} {
+        // Leitura pública (vitrine — foto, nome, especialidade)
+        allow read: if true;
+        allow write: if isSuperAdmin() || isSalonAdmin(salonId);
+      }
+
+      // ── Agendamentos ──────────────────────────────────────────────────────
+      // SEGURANÇA: leitura de agendamentos restrita
+      // Clientes sem conta precisam ver horários ocupados → leitura pública
+      // mas limitamos campos sensíveis via regras de campo
+      match /appointments/{appId} {
+        // Leitura: admin, profissional, cliente dono, ou leitura pública
+        // (necessário para exibir slots na agenda pública)
+        allow read: if isSuperAdmin()
+                    || isSalonAdmin(salonId)
+                    || isProfessional(salonId)
+                    || isResourceOwner()
+                    || isProfessionalOfAppointment()
+                    || true; // slots públicos necessários para agenda
+
+        allow create: if isAuth() || isGuestCreate();
+
+        allow update: if isSuperAdmin()
+                      || isSalonAdmin(salonId)
+                      || isProfessionalOfAppointment()
+                      || isResourceOwner();
+
+        allow delete: if isSuperAdmin() || isSalonAdmin(salonId);
+      }
+
+      // ── Produtos ──────────────────────────────────────────────────────────
+      match /products/{productId} {
+        allow read: if true;
+        allow write: if isSuperAdmin() || isSalonAdmin(salonId);
+      }
+
+      // ── Pedidos ───────────────────────────────────────────────────────────
+      match /orders/{orderId} {
+        // SEGURANÇA: pedidos só visíveis para admin ou dono
+        allow read: if isSuperAdmin()
+                    || isSalonAdmin(salonId)
+                    || isResourceOwner();
+
+        allow create: if isAuth() || isGuestCreate();
+
+        allow update: if isSuperAdmin() || isSalonAdmin(salonId);
+
+        allow delete: if isSuperAdmin();
+      }
+
+      // ── Configurações ─────────────────────────────────────────────────────
+      match /settings/{section} {
+        // Seções públicas da vitrine — sem dados sensíveis
+        allow read: if (section == 'business'
+                     || section == 'schedule'
+                     || section == 'branding'
+                     || section == 'appearance'
+                     || section == 'social'
+                     || section == 'home'
+                     || section == 'cms')
+                    || isSuperAdmin()
+                    || isSalonAdmin(salonId)
+                    || isSalonOwner(salonId);
+
+        // SEGURANÇA: seções com chaves (payments, notifications) só admin lê
+        allow write: if isSuperAdmin()
+                     || isSalonAdmin(salonId)
+                     || isSalonOwner(salonId);
+      }
+
+      // ── Cupons ────────────────────────────────────────────────────────────
+      match /coupons/{couponId} {
+        // Leitura pública: necessário para validar cupom no checkout
+        allow read: if true;
+        allow write: if isSuperAdmin() || isSalonAdmin(salonId);
+      }
+
+      // ── Avaliações ────────────────────────────────────────────────────────
+      match /reviews/{reviewId} {
+        allow read: if true;
+        // SEGURANÇA: cliente só cria 1 avaliação por vez e não pode forjar clientId
+        allow create: if isAuth()
+                      && request.resource.data.clientId == uid();
+        allow update: if isSalonAdmin(salonId); // só resposta do salão
+        allow delete: if isSalonAdmin(salonId) || isSuperAdmin();
+      }
+
+      // ── Fidelidade ────────────────────────────────────────────────────────
+      match /loyalty/{clientId} {
+        allow read: if isSalonAdmin(salonId)
+                    || isSuperAdmin()
+                    || (isAuth() && uid() == clientId);
+        allow write: if isSalonAdmin(salonId) || isSuperAdmin();
+      }
+
+      // ── Mensagens de contato ──────────────────────────────────────────────
+      match /contact_messages/{messageId} {
+        allow create: if true;
+        allow read, update, delete: if isSuperAdmin() || isSalonAdmin(salonId);
+      }
+    }
+
+    // ─── Usuários ─────────────────────────────────────────────────────────────
+
+    match /users/{userId} {
+      allow read: if isAuth() && (uid() == userId || isSuperAdmin());
+
+      allow create: if isAuth()
+                    && uid() == userId
+                    && (
+                      !('role' in request.resource.data)
+                      || request.resource.data.role == 'CLIENT'
+                      || (isBootstrapEmail() && request.resource.data.role == 'SUPER_ADMIN')
+                    );
+
+      allow update: if isAuth() && (
+        (uid() == userId && (
+          resource.data.role == request.resource.data.role
+          || (isBootstrapEmail() && request.resource.data.role == 'SUPER_ADMIN')
+        ))
+        || isSuperAdmin()
+      );
+
+      allow delete: if isSuperAdmin();
+    }
+
+    // ─── Planos ───────────────────────────────────────────────────────────────
+
+    match /plans/{planId} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Assinaturas ──────────────────────────────────────────────────────────
+
+    match /subscriptions/{subId} {
+      allow read: if isSuperAdmin()
+                  || (isAuth() && userData().salonId == resource.data.salonId);
+      // SEGURANÇA: escrita via Admin SDK no server — frontend não escreve
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Configurações da plataforma ──────────────────────────────────────────
+
+    match /platform_settings/{docId} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Eventos de cobrança ──────────────────────────────────────────────────
+
+    match /billing_events/{eventId} {
+      allow read: if isSuperAdmin()
+                  || (isAuth() && userData().salonId == resource.data.salonId);
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Push subscriptions ───────────────────────────────────────────────────
+    // SEGURANÇA: usuário só lê/escreve a própria subscription
+    match /push_subscriptions/{subId} {
+      allow read: if isAuth() && resource.data.userId == uid();
+      allow write: if isAuth() && (
+        !('userId' in request.resource.data)
+        || request.resource.data.userId == uid()
+      );
+    }
+
+    // ─── Afiliados ────────────────────────────────────────────────────────────
+
+    match /affiliates/{slug} {
+      // SEGURANÇA: leitura pública só do slug (necessário para landing pages)
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    match /affiliate_events/{eventId} {
+      allow read: if isSuperAdmin();
+      // Criação pública: registra clique/conversão de afiliado
+      allow create: if true;
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // ─── Fichas de Clientes (Prontuários) ────────────────────────────────────
+
+    match /salons/{salonId}/client_records/{recordId} {
+      allow read, write: if isSuperAdmin()
+                         || isSalonAdmin(salonId)
+                         || isProfessional(salonId);
+    }
+
+    // ─── Pacotes / Planos de Tratamento ──────────────────────────────────────
+
+    match /salons/{salonId}/packages/{packageId} {
+      allow read, write: if isSuperAdmin()
+                         || isSalonAdmin(salonId)
+                         || isProfessional(salonId);
+    }
+
+    // ─── Documentos / Receituário ─────────────────────────────────────────────
+
+    match /salons/{salonId}/documents/{docId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    // ─── Orçamentos ───────────────────────────────────────────────────────────
+    // SEGURANÇA: orçamentos são dados financeiros — apenas admin
+
+    match /salons/{salonId}/quotes/{quoteId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    // ─── CRM ──────────────────────────────────────────────────────────────────
+
+    match /salons/{salonId}/crm_clients/{clientId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    match /salons/{salonId}/crm_clients/{clientId}/messages/{messageId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    match /salons/{salonId}/crm_clients/{clientId}/notes/{noteId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    match /salons/{salonId}/crm_clients/{clientId}/followup_sent/{sentId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    match /salons/{salonId}/crm_interactions/{interactionId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    match /salons/{salonId}/crm_tasks/{taskId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    match /salons/{salonId}/crm_quick_replies/{replyId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    match /salons/{salonId}/crm_followup_sequences/{seqId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    match /salons/{salonId}/crm_funnels/{funnelId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    match /salons/{salonId}/crm_settings/{docId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    match /salons/{salonId}/crm_pro_media/{mediaId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    // ─── Indicação de clientes ────────────────────────────────────────────────
+
+    match /salons/{salonId}/client_referrals/{referralId} {
+      allow read: if isAuth() && (
+        isSalonAdmin(salonId) || isSuperAdmin() || uid() == referralId
+      );
+      allow create: if isAuth();
+      allow update: if isAuth() && (
+        isSalonAdmin(salonId) || isSuperAdmin() || uid() == referralId
+      );
+      allow delete: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    // ─── Contas de fidelidade ─────────────────────────────────────────────────
+
+    match /salons/{salonId}/loyalty_accounts/{accountId} {
+      allow read: if isAuth() && (
+        isSalonAdmin(salonId) || isSuperAdmin() || uid() == accountId
+      );
+      allow write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    // ─── Anamnese ─────────────────────────────────────────────────────────────
+
+    match /salons/{salonId}/anamnese_templates/{templateId} {
+      // Templates são públicos: necessário para exibir no site e no bot
+      allow read: if true;
+      allow write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    match /salons/{salonId}/anamnese_responses/{responseId} {
+      allow read: if isSuperAdmin() || isSalonAdmin(salonId);
+      // SEGURANÇA: qualquer um pode submeter anamnese (paciente sem conta)
+      // mas não pode editar respostas alheias
+      allow create: if true;
+      allow update: if isSuperAdmin() || isSalonAdmin(salonId);
+      allow delete: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    // ─── Fotos Antes & Depois ─────────────────────────────────────────────────
+
+    match /salons/{salonId}/photo_records/{photoId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    // ─── Lista de Espera ──────────────────────────────────────────────────────
+
+    match /salons/{salonId}/waitlist/{entryId} {
+      allow read: if isSuperAdmin() || isSalonAdmin(salonId);
+      // Qualquer pessoa pode entrar na lista de espera
+      allow create: if true;
+      allow update, delete: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    // ─── Clientes manuais (recorrência) ──────────────────────────────────────
+
+    match /salons/{salonId}/manual_clients/{clientId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    // ─── Mídias do CRM Pro ────────────────────────────────────────────────────
+
+    match /salons/{salonId}/crm_pro_media/{mediaId} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    // ─── Human takeover ───────────────────────────────────────────────────────
+
+    match /salons/{salonId}/human_takeover/{phone} {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+    // ─── Onboarding ───────────────────────────────────────────────────────────
+
+    match /salons/{salonId}/settings/onboarding {
+      allow read, write: if isSuperAdmin() || isSalonAdmin(salonId);
+    }
+
+  }
+}

@@ -1,0 +1,3099 @@
+import 'dotenv/config';
+import express from "express";
+import { createServer as createViteServer } from "vite";
+import path from "path";
+import { fileURLToPath } from "url";
+import Stripe from "stripe";
+import { FieldValue } from "firebase-admin/firestore";
+import { adminDb, adminAuth } from "./src/lib/firebase-admin.js";
+import cron from 'node-cron';
+import webpush from 'web-push';
+import multer from 'multer';
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+// ─── Web Push (notificações) ──────────────────────────────────────────────────
+if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    `mailto:${process.env.GMAIL_USER || 'admin@seusite.com'}`,
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+}
+
+async function sendPushToUser(userId: string, payload: object) {
+  if (!process.env.VAPID_PUBLIC_KEY) return;
+  try {
+    const subsSnap = await adminDb.collection("push_subscriptions")
+      .where("userId", "==", userId).get();
+    for (const d of subsSnap.docs) {
+      try {
+        await webpush.sendNotification(d.data().subscription, JSON.stringify(payload));
+      } catch (e: any) {
+        if (e.statusCode === 410) await d.ref.delete(); // expirada
+      }
+    }
+  } catch (e) {
+    console.error("[Push]", e);
+  }
+}
+
+async function sendPushToSalon(salonId: string, payload: object) {
+  if (!process.env.VAPID_PUBLIC_KEY) return;
+  try {
+    const subsSnap = await adminDb.collection("push_subscriptions")
+      .where("salonId", "==", salonId).get();
+    for (const d of subsSnap.docs) {
+      try {
+        await webpush.sendNotification(d.data().subscription, JSON.stringify(payload));
+      } catch (e: any) {
+        if (e.statusCode === 410) await d.ref.delete();
+      }
+    }
+  } catch (e) {
+    console.error("[Push salon]", e);
+  }
+}
+import nodemailer from 'nodemailer';
+
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
+
+const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+// ─── Email via Gmail/Nodemailer ───────────────────────────────────────────────
+const emailTransporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_APP_PASSWORD,
+  },
+});
+
+async function sendEmail({ to, subject, html }: { to: string; subject: string; html: string }) {
+  if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
+    console.warn('[Email] GMAIL_USER ou GMAIL_APP_PASSWORD não configurado.');
+    return;
+  }
+  try {
+    const info = await emailTransporter.sendMail({
+      from: `"${process.env.EMAIL_FROM_NAME || 'Bella & Chic'}" <${process.env.GMAIL_USER}>`,
+      to,
+      subject,
+      html,
+    });
+    console.log(`[Email] ✓ Enviado para ${to}: ${subject} (${info.messageId})`);
+  } catch (error) {
+    console.error('[Email] Erro ao enviar:', error);
+  }
+}
+
+// ─── Evolution API (WhatsApp) ────────────────────────────────────────────────
+// Configure no .env:
+//   EVOLUTION_API_URL=https://sua-evolution.com
+//   EVOLUTION_API_KEY=sua-chave-aqui
+//   EVOLUTION_INSTANCE=nome-da-instancia
+const EVOLUTION_URL      = process.env.EVOLUTION_API_URL || "";
+const EVOLUTION_API_KEY  = process.env.EVOLUTION_API_KEY || "";
+const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE || "";
+
+/**
+ * Envia mensagem de WhatsApp via Evolution API.
+ * number: formato internacional sem +, ex: 5511999999999
+ */
+async function sendWhatsApp(number: string, message: string, instanceName?: string): Promise<boolean> {
+  if (!EVOLUTION_URL || !EVOLUTION_API_KEY) {
+    console.warn("[WhatsApp] Evolution API não configurada. Adicione EVOLUTION_API_URL e EVOLUTION_API_KEY no .env");
+    return false;
+  }
+
+  // Usa instância do salão se passada, senão cai para a instância global do .env
+  const instance = instanceName || EVOLUTION_INSTANCE;
+  if (!instance) {
+    console.warn("[WhatsApp] Nenhuma instância disponível para envio.");
+    return false;
+  }
+
+  // Remove tudo que não for dígito e garante DDD + número
+  const cleaned = number.replace(/\D/g, "");
+  if (cleaned.length < 10) {
+    console.warn("[WhatsApp] Número inválido:", number);
+    return false;
+  }
+
+  // Se não começar com 55, adiciona o DDI do Brasil
+  const formatted = cleaned.startsWith("55") ? cleaned : `55${cleaned}`;
+
+  try {
+    const res = await fetch(
+      `${EVOLUTION_URL}/message/sendText/${instance}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "apikey": EVOLUTION_API_KEY,
+        },
+        body: JSON.stringify({
+          number: formatted,
+          textMessage: { text: message },
+        }),
+      }
+    );
+
+    if (!res.ok) {
+      const err = await res.text();
+      console.error("[WhatsApp] Erro ao enviar:", err);
+      return false;
+    }
+
+    console.log(`[WhatsApp] Mensagem enviada para ${formatted}`);
+    return true;
+  } catch (error) {
+    console.error("[WhatsApp] Falha na requisição:", error);
+    return false;
+  }
+}
+
+/**
+ * Formata a mensagem de lembrete substituindo as variáveis:
+ *   {{nome}}       → nome do cliente
+ *   {{data}}       → data do agendamento (dd/mm/yyyy)
+ *   {{horario}}    → horário de início
+ *   {{servico}}    → nome do serviço
+ *   {{profissional}} → nome do profissional
+ */
+function formatReminderMessage(template: string, vars: {
+  nome: string;
+  data: string;
+  horario: string;
+  servico: string;
+  profissional: string;
+}): string {
+  return template
+    .replace(/\{\{nome\}\}/gi, vars.nome)
+    .replace(/\{\{data\}\}/gi, vars.data)
+    .replace(/\{\{horario\}\}/gi, vars.horario)
+    .replace(/\{\{servico\}\}/gi, vars.servico)
+    .replace(/\{\{profissional\}\}/gi, vars.profissional);
+}
+
+// ─── Função de lembrete de agendamentos ──────────────────────────────────────
+async function sendAppointmentReminders() {
+  const now = new Date();
+  const tomorrow = new Date(now);
+  tomorrow.setDate(now.getDate() + 1);
+  const tomorrowStr = tomorrow.toISOString().split('T')[0];
+
+  try {
+    const appointmentsRef = adminDb.collectionGroup('appointments');
+    const q = appointmentsRef
+      .where('date', '==', tomorrowStr)
+      .where('status', 'in', ['CONFIRMED', 'PENDING'])
+      .where('reminderSent', '==', false);
+
+    const snapshot = await q.get();
+    console.log(`[Lembrete] Enviando para ${snapshot.size} agendamentos de amanhã.`);
+
+    for (const doc of snapshot.docs) {
+      const apt = doc.data();
+
+      // Busca o salonId a partir do path do documento (salons/{salonId}/appointments/{id})
+      const pathParts = doc.ref.path.split('/');
+      const salonId = pathParts[1];
+
+      // Busca a mensagem personalizada do dono do salão
+      let reminderTemplate = "";
+      try {
+        const settingsDoc = await adminDb.doc(`salons/${salonId}/settings/notifications`).get();
+        const settingsData = settingsDoc.data() as any;
+        reminderTemplate = settingsData?.whatsappReminderMessage || "";
+      } catch {
+        // sem settings, usa template padrão
+      }
+
+      // Template padrão se o dono não configurou
+      if (!reminderTemplate) {
+        reminderTemplate =
+          "Olá {{nome}}! 👋\n\nLembrando que você tem um agendamento amanhã:\n\n" +
+          "✂️ Serviço: {{servico}}\n" +
+          "👤 Profissional: {{profissional}}\n" +
+          "📅 Data: {{data}}\n" +
+          "🕐 Horário: {{horario}}\n\n" +
+          "Estamos te esperando! Até lá 😊";
+      }
+
+      // Formata a data no padrão br
+      const [year, month, day] = apt.date.split('-');
+      const dataBR = `${day}/${month}/${year}`;
+
+      const message = formatReminderMessage(reminderTemplate, {
+        nome: apt.clientName || "Cliente",
+        data: dataBR,
+        horario: apt.startTime,
+        servico: apt.serviceName,
+        profissional: apt.professionalName,
+      });
+
+      // Envia WhatsApp usando a instância do salão (ou global se não tiver)
+      if (apt.customerPhone) {
+        await sendWhatsApp(apt.customerPhone, message, `salon_${salonId}`);
+      }
+
+      // Também envia email se tiver (mantém compatibilidade)
+      if (apt.customerEmail) {
+        await sendEmail({
+          to: apt.customerEmail,
+          subject: `Lembrete: agendamento amanhã às ${apt.startTime}`,
+          html: `
+            <div style="font-family: sans-serif; max-width: 500px; margin: 0 auto;">
+              <h2>Olá ${apt.clientName}!</h2>
+              <p>Você tem um agendamento amanhã (<strong>${dataBR}</strong>) às <strong>${apt.startTime}</strong> para <strong>${apt.serviceName}</strong> com <strong>${apt.professionalName}</strong>.</p>
+              <p>Estamos te esperando!</p>
+              <hr />
+              <p style="font-size: 12px; color: #666;">Se precisar reagendar ou cancelar, entre em contato conosco.</p>
+            </div>
+          `,
+        });
+      }
+
+      // ── Push para o CLIENTE: lembrete de amanhã ─────────────────────────
+      if (apt.clientId && apt.clientId !== 'guest') {
+        try {
+          await sendPushToUser(apt.clientId, {
+            title: '🔔 Lembrete de Amanhã!',
+            body: `${apt.serviceName} amanhã às ${apt.startTime} com ${apt.professionalName}`,
+            url: `/s/${salonId}/meus-agendamentos`,
+            requireInteraction: true,
+            tag: `reminder-${apt.clientId}-${apt.date}`,
+          });
+        } catch (pushErr) {
+          console.error('[Push] Erro ao enviar push lembrete:', pushErr);
+        }
+      }
+
+      // ── Push para o DONO/PROFISSIONAL: agenda de amanhã ──────────────────
+      try {
+        const salonDoc = await adminDb.collection('salons').doc(salonId).get();
+        const salonSlugForPush = salonDoc.data()?.slug || '';
+        await sendPushToSalon(salonId, {
+          title: '📋 Agendamento Amanhã',
+          body: `${apt.clientName} — ${apt.serviceName} às ${apt.startTime}`,
+          url: `/s/${salonSlugForPush}/admin?tab=appointments`,
+          tag: `reminder-salon-${salonId}-${apt.date}-${apt.startTime}`,
+        });
+      } catch (pushErr) {
+        console.error('[Push] Erro ao enviar push lembrete salão:', pushErr);
+      }
+
+      await doc.ref.update({ reminderSent: true });
+    }
+  } catch (error) {
+    console.error("[Lembrete] Erro:", error);
+  }
+}
+
+// ─── CRM: Mensagem de aniversário ────────────────────────────────────────────
+async function sendBirthdayMessages() {
+  const today = new Date();
+  const mm = String(today.getMonth() + 1).padStart(2, '0');
+  const dd = String(today.getDate()).padStart(2, '0');
+  const todayMD = `${mm}-${dd}`; // "MM-DD"
+
+  try {
+    const salonsSnap = await adminDb.collection('salons').get();
+    for (const salonDoc of salonsSnap.docs) {
+      const salonId  = salonDoc.id;
+      const salon    = salonDoc.data();
+      const instance = `salon_${salonId}`;
+      const salonName = salon.name || 'nosso salão';
+
+      const clientsSnap = await adminDb.collection(`salons/${salonId}/crm_clients`).get();
+      for (const clientDoc of clientsSnap.docs) {
+        const client = clientDoc.data();
+        if (!client.birthdate || !client.phone) continue;
+
+        const clientMD = client.birthdate.slice(5); // "YYYY-MM-DD" → "MM-DD"
+        if (clientMD !== todayMD) continue;
+
+        const thisYear = today.getFullYear();
+        if (client.birthdayMsgYear === thisYear) continue; // já enviou esse ano
+
+        const firstName = (client.name || 'Cliente').split(' ')[0];
+        const msg =
+          `🎂 Feliz aniversário, ${firstName}!\n\n` +
+          `Toda a equipe do *${salonName}* deseja um dia incrível para você! 🥳🎉\n\n` +
+          `Que tal comemorar com a gente? Temos uma surpresa especial esperando. Venha nos visitar! 💖`;
+
+        await sendWhatsApp(client.phone, msg, instance);
+        await clientDoc.ref.update({ birthdayMsgYear: thisYear });
+        console.log(`[CRM Birthday] Enviado para ${client.name} (${salonId})`);
+      }
+    }
+  } catch (e) {
+    console.error('[CRM Birthday]', e);
+  }
+}
+
+// ─── CRM: Reengajamento (45 dias sem visita) ─────────────────────────────────
+async function checkReengagement() {
+  const cutoff45   = Date.now() - 45 * 24 * 60 * 60 * 1000;
+  const cooldown30 = 30 * 24 * 60 * 60 * 1000;
+
+  try {
+    const salonsSnap = await adminDb.collection('salons').get();
+    for (const salonDoc of salonsSnap.docs) {
+      const salonId   = salonDoc.id;
+      const salon     = salonDoc.data();
+      const instance  = `salon_${salonId}`;
+      const salonName = salon.name || 'nosso salão';
+
+      const clientsSnap = await adminDb.collection(`salons/${salonId}/crm_clients`).get();
+      for (const clientDoc of clientsSnap.docs) {
+        const client = clientDoc.data();
+        if (!client.phone || !client.lastVisit) continue;
+        if (client.status === 'inactive') continue;
+        if (client.lastVisit > cutoff45) continue; // visitou nos últimos 45 dias
+
+        const lastSent = client.lastReengagementSent || 0;
+        if (Date.now() - lastSent < cooldown30) continue; // cooldown de 30 dias
+
+        const firstName = (client.name || 'Cliente').split(' ')[0];
+        const diasSem   = Math.floor((Date.now() - client.lastVisit) / (24 * 60 * 60 * 1000));
+        const msg =
+          `Oi, ${firstName}! 😊\n\n` +
+          `Faz um tempinho que a gente não se vê no *${salonName}* e sentimos sua falta!\n\n` +
+          `Que tal agendar um horário? Estamos prontos para te atender com todo o carinho de sempre. ✨\n\n` +
+          `É só responder essa mensagem ou acessar nosso site para agendar!`;
+
+        await sendWhatsApp(client.phone, msg, instance);
+        await clientDoc.ref.update({ lastReengagementSent: Date.now() });
+        console.log(`[CRM Reengajamento] ${client.name} — ${diasSem} dias sem visita (${salonId})`);
+      }
+    }
+  } catch (e) {
+    console.error('[CRM Reengajamento]', e);
+  }
+}
+
+// ─── CRM: Upgrade automático para VIP ────────────────────────────────────────
+// Critério: 8+ visitas OU R$1.000+ gastos
+async function upgradeVIPClients() {
+  const VIP_VISITS = 8;
+  const VIP_SPENT  = 1000;
+
+  try {
+    const salonsSnap = await adminDb.collection('salons').get();
+    for (const salonDoc of salonsSnap.docs) {
+      const salonId  = salonDoc.id;
+      const instance = `salon_${salonId}`;
+
+      const clientsSnap = await adminDb.collection(`salons/${salonId}/crm_clients`).get();
+      for (const clientDoc of clientsSnap.docs) {
+        const client = clientDoc.data();
+        if (client.status === 'vip' || client.status === 'inactive') continue;
+
+        const isVIP =
+          (client.totalVisits || 0) >= VIP_VISITS ||
+          (client.totalSpent  || 0) >= VIP_SPENT;
+
+        if (!isVIP) continue;
+
+        await clientDoc.ref.update({ status: 'vip', updatedAt: Date.now() });
+        console.log(`[CRM VIP] ${client.name} promovido a VIP (${salonId})`);
+
+        // Avisa o dono pelo WhatsApp
+        const businessDoc = await adminDb.doc(`salons/${salonId}/settings/business`).get();
+        const business    = businessDoc.data() as any;
+        if (business?.whatsapp) {
+          await sendWhatsApp(
+            business.whatsapp,
+            `⭐ *Novo cliente VIP!*\n\n` +
+            `*${client.name}* atingiu o status VIP no seu CRM!\n` +
+            `Visitas: ${client.totalVisits || 0} | Total gasto: R$ ${Number(client.totalSpent || 0).toFixed(2)}\n\n` +
+            `Que tal mandar uma mensagem especial para ele? 🥰`,
+            instance
+          );
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[CRM VIP Upgrade]', e);
+  }
+}
+
+// ─── CRM: Auto-cadastro quando agendamento é COMPLETED ───────────────────────
+async function upsertCRMClient(salonId: string, apt: any) {
+  const phone = (apt.customerPhone || '').replace(/\D/g, '');
+  if (!phone || !apt.clientName) return;
+
+  try {
+    // Verifica se já existe pelo telefone
+    const existing = await adminDb.collection(`salons/${salonId}/crm_clients`)
+      .where('phone', '==', phone).limit(1).get();
+
+    const now = Date.now();
+    const amount = apt.totalAmount || 0;
+
+    if (!existing.empty) {
+      const doc = existing.docs[0];
+      const data = doc.data();
+      await doc.ref.update({
+        totalVisits: (data.totalVisits || 0) + 1,
+        totalSpent:  (data.totalSpent  || 0) + amount,
+        lastVisit:   now,
+        updatedAt:   now,
+      });
+      console.log(`[CRM AutoUpdate] ${apt.clientName} atualizado (${salonId})`);
+    } else {
+      await adminDb.collection(`salons/${salonId}/crm_clients`).add({
+        salonId,
+        name:        apt.clientName,
+        phone:       phone,
+        email:       apt.customerEmail || '',
+        status:      'client',
+        tags:        [],
+        source:      'agendamento',
+        notes:       '',
+        totalVisits: 1,
+        totalSpent:  amount,
+        lastVisit:   now,
+        createdAt:   now,
+        updatedAt:   now,
+      });
+      console.log(`[CRM AutoCreate] ${apt.clientName} criado no CRM (${salonId})`);
+    }
+  } catch (e) {
+    console.error('[CRM Upsert]', e);
+  }
+}
+
+// ─── Bot: memória de conversas (TTL 1 hora) ───────────────────────────────────
+const botConversations = new Map<string, { messages: any[]; lastAt: number }>();
+
+function getBotHistory(key: string) {
+  const entry = botConversations.get(key);
+  if (!entry) return [];
+  if (Date.now() - entry.lastAt > 60 * 60 * 1000) {
+    botConversations.delete(key);
+    return [];
+  }
+  return entry.messages;
+}
+
+function addBotMessage(key: string, role: 'user' | 'assistant', content: string) {
+  const history = getBotHistory(key);
+  history.push({ role, content });
+  // mantém só as últimas 20 mensagens
+  const trimmed = history.slice(-20);
+  botConversations.set(key, { messages: trimmed, lastAt: Date.now() });
+}
+
+// Limpa conversas antigas a cada 30 minutos
+setInterval(() => {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const [key, val] of botConversations.entries()) {
+    if (val.lastAt < cutoff) botConversations.delete(key);
+  }
+}, 30 * 60 * 1000);
+
+// ─── Bot: busca dados do salão para contexto ─────────────────────────────────
+async function getSalonBotContext(salonId: string) {
+  const [businessDoc, salonDoc, servicesSnap] = await Promise.all([
+    adminDb.doc(`salons/${salonId}/settings/business`).get(),
+    adminDb.collection('salons').doc(salonId).get(),
+    adminDb.collection(`salons/${salonId}/services`).where('active', '==', true).get(),
+  ]);
+
+  const business = businessDoc.data() as any || {};
+  const salon    = salonDoc.data()    as any || {};
+  const services = servicesSnap.docs.map(d => d.data() as any);
+
+  const APP_URL = process.env.APP_URL || 'http://localhost:3066';
+  const slug    = salon.slug || salonId;
+  const bookingLink = `${APP_URL}/s/${slug}/agendar`;
+
+  const hoursText = Object.entries(business.workingHours || {})
+    .filter(([, v]: any) => !v.closed)
+    .map(([day, v]: any) => `${day}: ${v.open}–${v.close}`)
+    .join(', ') || 'Consulte pelo WhatsApp';
+
+  const servicesText = services
+    .map((s: any) => `• ${s.name} — R$ ${Number(s.price).toFixed(2)} (${s.duration} min)`)
+    .join('\n') || 'Consulte nossos serviços';
+
+  const addressText = [business.address, business.number, business.neighborhood, business.city, business.state]
+    .filter(Boolean).join(', ') || 'Consulte pelo WhatsApp';
+
+  return { business, salon, services, slug, bookingLink, hoursText, servicesText, addressText };
+}
+
+// ─── Bot simples: responde por palavras-chave ─────────────────────────────────
+async function handleSimpleBot(salonId: string, from: string, text: string): Promise<string> {
+  const ctx = await getSalonBotContext(salonId);
+  const { business, salon, bookingLink, hoursText, servicesText, addressText } = ctx;
+  const salonName = salon.name || business.name || 'nosso salão';
+  const t = text.toLowerCase().trim();
+
+  const greetings = ['oi', 'olá', 'ola', 'bom dia', 'boa tarde', 'boa noite', 'hey', 'hello', 'menu', 'ajuda'];
+  if (greetings.some(g => t.includes(g)) || t === '' || t === '0') {
+    return (
+      `Olá! 👋 Bem-vindo ao *${salonName}*!\n\n` +
+      `Como posso te ajudar? Escolha uma opção:\n\n` +
+      `1️⃣ Agendar horário\n` +
+      `2️⃣ Ver serviços e preços\n` +
+      `3️⃣ Horário de funcionamento\n` +
+      `4️⃣ Endereço\n` +
+      `5️⃣ Falar com a equipe\n\n` +
+      `Responda com o número ou palavra-chave 😊`
+    );
+  }
+
+  if (t === '1' || t.includes('agend') || t.includes('horár') || t.includes('marcar')) {
+    return (
+      `📅 *Agendar Horário*\n\n` +
+      `Clique no link abaixo para ver os horários disponíveis e fazer seu agendamento online:\n\n` +
+      `👉 ${bookingLink}\n\n` +
+      `É rápido, fácil e você recebe confirmação aqui mesmo! 😊`
+    );
+  }
+
+  if (t === '2' || t.includes('serviç') || t.includes('preço') || t.includes('valor') || t.includes('quanto')) {
+    return (
+      `💈 *Nossos Serviços*\n\n` +
+      `${servicesText}\n\n` +
+      `Para agendar: ${bookingLink}\n\n` +
+      `0️⃣ Voltar ao menu`
+    );
+  }
+
+  if (t === '3' || t.includes('horário') || t.includes('funciona') || t.includes('abre') || t.includes('fecha')) {
+    return (
+      `🕐 *Horário de Funcionamento*\n\n` +
+      `${hoursText}\n\n` +
+      `0️⃣ Voltar ao menu`
+    );
+  }
+
+  if (t === '4' || t.includes('endereço') || t.includes('localiz') || t.includes('onde') || t.includes('fica')) {
+    const mapsLink = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addressText)}`;
+    return (
+      `📍 *Endereço*\n\n` +
+      `${addressText}\n\n` +
+      `🗺️ Ver no mapa: ${mapsLink}\n\n` +
+      `0️⃣ Voltar ao menu`
+    );
+  }
+
+  if (t === '5' || t.includes('falar') || t.includes('contato') || t.includes('telefone') || t.includes('atendente') || t.includes('humano')) {
+    const phone = business.whatsapp || business.phone || '';
+    return (
+      `💬 *Falar com a Equipe*\n\n` +
+      `Nossa equipe está pronta para te atender!\n` +
+      (phone ? `📞 ${phone}\n` : '') +
+      `\nOu acesse: ${bookingLink}\n\n` +
+      `0️⃣ Voltar ao menu`
+    );
+  }
+
+  // Fallback: menu
+  return (
+    `Não entendi muito bem, mas posso te ajudar! 😊\n\n` +
+    `Escolha uma opção:\n\n` +
+    `1️⃣ Agendar horário\n` +
+    `2️⃣ Ver serviços e preços\n` +
+    `3️⃣ Horário de funcionamento\n` +
+    `4️⃣ Endereço\n` +
+    `5️⃣ Falar com a equipe`
+  );
+}
+
+// ─── Bot inteligente: usa Groq (gratuito) ────────────────────────────────────
+// Cadastre em groq.com e pegue uma API key gratuita
+// Adicione no .env: GROQ_API_KEY=sua_chave
+async function handleSmartBot(salonId: string, from: string, text: string): Promise<string> {
+  const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+  if (!GROQ_API_KEY) {
+    // Fallback para bot simples se não tiver GROQ configurado
+    return handleSimpleBot(salonId, from, text);
+  }
+
+  try {
+    const ctx = await getSalonBotContext(salonId);
+    const { salon, business, bookingLink, hoursText, servicesText, addressText } = ctx;
+    const salonName = salon.name || business.name || 'Salão';
+
+    const systemPrompt =
+      `Você é o assistente virtual do *${salonName}*, um salão de beleza/barbearia. ` +
+      `Responda sempre em português brasileiro, de forma simpática, objetiva e profissional. ` +
+      `Use emojis moderadamente. Nunca invente informações — use apenas os dados abaixo.\n\n` +
+      `## Dados do salão\n` +
+      `**Nome:** ${salonName}\n` +
+      `**Endereço:** ${addressText}\n` +
+      `**Horários:** ${hoursText}\n` +
+      `**Serviços:**\n${servicesText}\n` +
+      `**Link de agendamento:** ${bookingLink}\n` +
+      `**WhatsApp/Telefone:** ${business.whatsapp || business.phone || 'não informado'}\n\n` +
+      `## Regras\n` +
+      `- Para agendar, sempre mande o link: ${bookingLink}\n` +
+      `- Se perguntarem algo que não sabe, diga que vai verificar e peça para entrar em contato\n` +
+      `- Seja breve — máximo 3 parágrafos por resposta\n` +
+      `- Se o cliente quiser falar com humano, informe o WhatsApp do salão`;
+
+    const convKey = `${salonId}:${from}`;
+    const history = getBotHistory(convKey);
+    addBotMessage(convKey, 'user', text);
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...history,
+      { role: 'user', content: text },
+    ];
+
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant',
+        messages,
+        max_tokens: 512,
+        temperature: 0.7,
+      }),
+    });
+
+    if (!res.ok) throw new Error(`Groq error: ${res.status}`);
+    const data = await res.json() as any;
+    const reply = data.choices?.[0]?.message?.content || '';
+
+    if (reply) addBotMessage(convKey, 'assistant', reply);
+    return reply || handleSimpleBot(salonId, from, text);
+  } catch (e) {
+    console.error('[SmartBot]', e);
+    return handleSimpleBot(salonId, from, text);
+  }
+}
+
+// Roda todo dia às 8h da manhã
+// Roda todo dia às 8h da manhã
+cron.schedule('0 8 * * *', () => {
+  console.log('[Cron 8h] Rodando jobs diários...');
+  sendAppointmentReminders().catch(console.error);
+  sendBirthdayMessages().catch(console.error);
+  checkReengagement().catch(console.error);
+  upgradeVIPClients().catch(console.error);
+});
+
+// ─── Cron: verifica reservas expiradas (a cada hora) ─────────────────────────
+// ── Cron: libera horários com sinal expirado (a cada 5 minutos) ─────────────
+cron.schedule('*/5 * * * *', async () => {
+  try {
+    const now = Date.now();
+    const expired = await adminDb.collectionGroup('appointments')
+      .where('status', '==', 'AWAITING_DEPOSIT')
+      .where('depositExpiresAt', '<=', now)
+      .get();
+
+    const batch = adminDb.batch();
+    expired.docs.forEach(doc => {
+      batch.update(doc.ref, {
+        status: 'CANCELLED',
+        depositStatus: 'PENDING',
+        cancelledReason: 'Sinal não pago no prazo de 30 minutos',
+        updatedAt: now,
+      });
+    });
+    if (!expired.empty) {
+      await batch.commit();
+      console.log(`[Deposit Cron] ${expired.size} agendamentos cancelados por falta de sinal`);
+    }
+  } catch (e) {
+    console.error('[Deposit Cron]', e);
+  }
+});
+
+cron.schedule('0 * * * *', async () => {
+  try {
+    const now = Date.now();
+    const fourHoursAgo = now - 4 * 60 * 60 * 1000;
+    const eightHoursAgo = now - 8 * 60 * 60 * 1000;
+
+    const reservedOrders = await adminDb.collectionGroup("orders")
+      .where("status", "==", "RESERVED")
+      .get();
+
+    for (const d of reservedOrders.docs) {
+      const order = d.data();
+      const path = d.ref.path.split("/");
+      const salonId = path[1];
+      const createdAt = order.createdAt || 0;
+
+      // Auto-completa como COMPLETED após 8h (dono esqueceu de dar baixa)
+      if (createdAt < eightHoursAgo) {
+        await d.ref.update({ status: "COMPLETED", updatedAt: now });
+        console.log("[Reserva] Auto-completado:", d.id);
+        continue;
+      }
+
+      // Lembrete para o dono após 4h sem confirmar pagamento
+      if (createdAt < fourHoursAgo && !order.reservationReminderSent) {
+        const businessDoc = await adminDb.doc(`salons/${salonId}/settings/business`).get();
+        const business = businessDoc.data() as any;
+        if (business?.whatsapp) {
+          await sendWhatsApp(
+            business.whatsapp,
+            `⚠️ Lembrete: reserva pendente de confirmação!\n\n` +
+            `Cliente: ${order.customerName || "—"}\n` +
+            `Valor: R$ ${Number(order.totalAmount || 0).toFixed(2)}\n\n` +
+            `Acesse o painel para confirmar o pagamento e dar baixa no pedido.`,
+            `salon_${salonId}`
+          );
+        }
+        await d.ref.update({ reservationReminderSent: true });
+      }
+    }
+  } catch (e) {
+    console.error("[Reserva Cron]", e);
+  }
+});
+
+// ─── Mercado Pago ────────────────────────────────────────────────────────────
+const MP_ACCESS_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || "";
+const MP_BASE_URL = "https://api.mercadopago.com";
+
+async function createMpPreference(payload: object): Promise<any> {
+  const res = await fetch(`${MP_BASE_URL}/checkout/preferences`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Mercado Pago error: ${err}`);
+  }
+  return res.json();
+}
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Middleware to verify Firebase Auth Token
+const authenticateUser = async (
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthorized: Missing or invalid token" });
+  }
+
+  const idToken = authHeader.split("Bearer ")[1];
+
+  try {
+    const decodedToken = await adminAuth.verifyIdToken(idToken);
+    (req as any).user = decodedToken;
+    next();
+  } catch (error) {
+    console.error("Error verifying auth token:", error);
+    return res.status(401).json({ error: "Unauthorized: Invalid token" });
+  }
+};
+
+async function getRequestUserProfile(uid: string) {
+  const userDoc = await adminDb.collection("users").doc(uid).get();
+  return userDoc.exists ? userDoc.data() as any : null;
+}
+
+async function startServer() {
+  const app = express();
+  const PORT = Number(process.env.PORT) || 3066;
+  const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
+
+  // Middleware para definir cabeçalhos de segurança e charset
+  app.use((req, res, next) => {
+    if (req.url.endsWith('.html') || req.accepts('html')) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    } else if (req.url.endsWith('.js')) {
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    } else if (req.url.endsWith('.css')) {
+      res.setHeader('Content-Type', 'text/css; charset=utf-8');
+    }
+    // REMOVIDO: Cross-Origin-Opener-Policy bloqueava o popup do Google OAuth
+    next();
+  });
+
+  // ─── Stripe Webhook (raw body obrigatório) ───────────────────────────────
+  app.post("/api/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+    if (!stripe || !endpointSecret) {
+      return res.status(400).send("Stripe not configured");
+    }
+
+    const sig = req.headers["stripe-signature"] as string;
+    let event: Stripe.Event;
+
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+    } catch (err: any) {
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      switch (event.type) {
+        case "checkout.session.completed": {
+          const session = event.data.object as Stripe.Checkout.Session;
+          const kind = session.metadata?.kind;
+
+          if (kind === "subscription") {
+            const salonId = session.metadata?.salonId;
+            if (salonId && session.subscription) {
+              const subscriptionId = String(session.subscription);
+              let subscriptionData: Stripe.Subscription | null = null;
+              try {
+                subscriptionData = await stripe.subscriptions.retrieve(subscriptionId);
+              } catch (error) {
+                console.error("Error retrieving Stripe subscription:", error);
+              }
+
+              await adminDb.collection("subscriptions").doc(subscriptionId).set(
+                {
+                  salonId,
+                  status: "ACTIVE",
+                  stripeSubscriptionId: subscriptionId,
+                  planId:
+                    subscriptionData?.items?.data?.[0]?.price?.id ||
+                    session.metadata?.priceId ||
+                    null,
+                  currentPeriodEnd:
+                    subscriptionData?.items?.data?.[0]?.current_period_end
+                      ? subscriptionData.items.data[0].current_period_end * 1000
+                      : null,
+                  cancelAtPeriodEnd: subscriptionData?.cancel_at_period_end || false,
+                  customerId:
+                    typeof session.customer === "string" ? session.customer : null,
+                  checkoutSessionId: session.id,
+                  createdAt: Date.now(),
+                  updatedAt: Date.now(),
+                },
+                { merge: true }
+              );
+
+              await adminDb.collection("salons").doc(salonId).set(
+                {
+                  status: "ACTIVE",
+                  subscriptionId,
+                  updatedAt: Date.now(),
+                },
+                { merge: true }
+              );
+
+              await adminDb.collection("billing_events").add({
+                salonId,
+                type: "SUBSCRIPTION_CHECKOUT_COMPLETED",
+                status: "SUCCESS",
+                metadata: {
+                  subscriptionId,
+                  checkoutSessionId: session.id,
+                },
+                createdAt: Date.now(),
+              });
+
+              console.log(`Subscription payment successful for salon ${salonId}, session: ${session.id}`);
+
+              // ── Processa afiliado após pagamento confirmado ────────────────
+              const salonSnapForAff = await adminDb.collection("salons").doc(salonId).get();
+              const salonDataAff = salonSnapForAff.data() as any;
+              const affRef = session.metadata?.affiliateRef || salonDataAff?.affiliateRef;
+              const discountApplied = Number(session.metadata?.discountApplied || 0);
+
+              if (affRef && !salonDataAff?.affiliateDiscountApplied) {
+                // Marca desconto como aplicado
+                await adminDb.collection("salons").doc(salonId).update({
+                  affiliateDiscountApplied: true,
+                  affiliateDiscountValue: discountApplied,
+                  affiliatePaidAt: Date.now(),
+                });
+
+                // Descobre se é salão indicador ou marketeiro
+                const [refSalonSnap, marketerSnap] = await Promise.all([
+                  adminDb.collection("salons").where("slug", "==", affRef).limit(1).get(),
+                  adminDb.collection("affiliates").doc(affRef).get(),
+                ]);
+
+                // Verifica se link de marketeiro está ativo e não expirado
+                if (marketerSnap.exists) {
+                  const mData = marketerSnap.data() as any;
+                  const expired = mData?.expiresAt && Date.now() > mData.expiresAt;
+                  const inactive = mData?.active === false;
+                  if (expired || inactive) {
+                    console.log(`[Affiliate] Link ${affRef} ${expired ? 'expirado' : 'inativo'} — comissão não registrada`);
+                    break;
+                  }
+                }
+
+                if (!refSalonSnap.empty) {
+                  // SALÃO INDICADOR: ganha crédito de 10% de desconto
+                  const refSalonRef = refSalonSnap.docs[0].ref;
+                  const currentCredits = refSalonSnap.docs[0].data().referralCredits || 0;
+                  const newCredits = currentCredits + 1;
+                  const newDiscount = Math.min(newCredits * 15, 50);
+                  await refSalonRef.update({
+                    referralCredits: newCredits,
+                    referralDiscountPct: newDiscount,
+                    updatedAt: Date.now(),
+                  });
+                  // Registra evento de crédito
+                  await adminDb.collection("affiliate_events").add({
+                    type: "SALON_REFERRAL_CREDIT",
+                    referrerSlug: affRef,
+                    newSalonId: salonId,
+                    creditsGranted: 1,
+                    discountEarned: newDiscount,
+                    createdAt: Date.now(),
+                  });
+                  console.log(`[Affiliate] Crédito +1 para salão ${affRef} → desconto agora ${newDiscount}%`);
+
+                } else if (marketerSnap.exists) {
+                  // MARKETEIRO: registra comissão de 30% a pagar
+                  const planPrice = subscriptionData?.items?.data?.[0]?.price?.unit_amount
+                    ? subscriptionData.items.data[0].price.unit_amount / 100
+                    : 0;
+                  const commissionValue = planPrice * (30 / 100);
+
+                  await marketerSnap.ref.update({
+                    totalConversions: FieldValue.increment(1),
+                    pendingPayment: FieldValue.increment(commissionValue),
+                    updatedAt: Date.now(),
+                  });
+                  await adminDb.collection("affiliate_events").add({
+                    type: "MARKETER_COMMISSION",
+                    marketerSlug: affRef,
+                    newSalonId: salonId,
+                    planPrice,
+                    commissionValue,
+                    commissionPct: 30,
+                    paid: false,
+                    createdAt: Date.now(),
+                  });
+                  console.log(`[Affiliate] Comissão R$${commissionValue.toFixed(2)} para marketeiro ${affRef}`);
+                }
+              }
+            }
+          }
+          break;
+        }
+
+        case "customer.subscription.updated":
+        case "customer.subscription.deleted": {
+          const subscription = event.data.object as Stripe.Subscription;
+
+          // ── Quando um salão cancela, remove crédito do indicador ──────────
+          if (event.type === "customer.subscription.deleted") {
+            try {
+              // Acha o salão que cancelou
+              const cancelledSalonSnap = await adminDb.collection("salons")
+                .where("subscriptionId", "==", subscription.id).limit(1).get();
+              if (!cancelledSalonSnap.empty) {
+                const cancelledSalon = cancelledSalonSnap.docs[0].data() as any;
+                const referrerSlug = cancelledSalon.affiliateRef;
+                const affiliateType = cancelledSalon.affiliateType;
+
+                if (referrerSlug && affiliateType === "salon") {
+                  // Busca o salão indicador e remove 1 crédito
+                  const referrerSnap = await adminDb.collection("salons")
+                    .where("slug", "==", referrerSlug).limit(1).get();
+                  if (!referrerSnap.empty) {
+                    const refDoc = referrerSnap.docs[0];
+                    const currentCredits = Math.max(0, (refDoc.data().referralCredits || 0) - 1);
+                    const newDiscount = Math.min(currentCredits * 15, 50);
+                    await refDoc.ref.update({
+                      referralCredits: currentCredits,
+                      referralDiscountPct: newDiscount,
+                      updatedAt: Date.now(),
+                    });
+                    console.log(`[Affiliate] Crédito removido de ${referrerSlug}: agora ${currentCredits} créditos (${newDiscount}% desconto)`);
+                  }
+                }
+              }
+            } catch (e) {
+              console.error("[Affiliate] Erro ao remover crédito:", e);
+            }
+          }
+
+          const status =
+            subscription.status === "active"
+              ? "ACTIVE"
+              : subscription.status === "trialing"
+              ? "TRIAL"
+              : subscription.status === "past_due"
+              ? "PAST_DUE"
+              : "CANCELLED";
+
+          const subDoc = await adminDb.collection("subscriptions").doc(subscription.id).get();
+          if (subDoc.exists) {
+            const data = subDoc.data();
+            await adminDb.collection("subscriptions").doc(subscription.id).set(
+              {
+                status,
+                currentPeriodEnd: subscription.items.data[0]?.current_period_end
+                  ? subscription.items.data[0].current_period_end * 1000
+                  : null,
+                planId: subscription.items.data[0]?.price?.id || null,
+                cancelAtPeriodEnd: subscription.cancel_at_period_end,
+                updatedAt: Date.now(),
+              },
+              { merge: true }
+            );
+            if (data?.salonId) {
+              await adminDb.collection("salons").doc(data.salonId).set(
+                {
+                  status:
+                    status === "ACTIVE"
+                      ? "ACTIVE"
+                      : status === "TRIAL"
+                      ? "TRIAL"
+                      : status === "CANCELLED"
+                      ? "CANCELLED"
+                      : "BLOCKED",
+                  updatedAt: Date.now(),
+                },
+                { merge: true }
+              );
+            }
+          }
+          await adminDb.collection("billing_events").add({
+            salonId: subDoc.exists ? subDoc.data()?.salonId : "unknown",
+            type:
+              event.type === "customer.subscription.updated"
+                ? "SUBSCRIPTION_UPDATED"
+                : "SUBSCRIPTION_CANCELLED",
+            status: "SUCCESS",
+            metadata: {
+              subscriptionId: subscription.id,
+              status,
+            },
+            createdAt: Date.now(),
+          });
+          console.log(`Subscription ${subscription.id} updated to status: ${status}`);
+          break;
+        }
+
+        default:
+          console.log(`Unhandled Stripe event type: ${event.type}`);
+          break;
+      }
+    } catch (error) {
+      console.error("Error processing webhook event:", error);
+      return res.status(500).send("Internal Server Error");
+    }
+
+    res.json({ received: true });
+  });
+
+  // ─── Mercado Pago Webhook ────────────────────────────────────────────────
+  app.post("/api/mp-webhook", express.json(), async (req, res) => {
+    try {
+      const { type, data } = req.body;
+
+      if (type !== "payment") {
+        return res.status(200).json({ received: true });
+      }
+
+      const paymentId = data?.id;
+      if (!paymentId) {
+        return res.status(400).json({ error: "Missing payment id" });
+      }
+
+      const paymentRes = await fetch(`${MP_BASE_URL}/v1/payments/${paymentId}`, {
+        headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+      });
+
+      if (!paymentRes.ok) {
+        console.error("MP: falha ao buscar pagamento", paymentId);
+        return res.status(200).json({ received: true });
+      }
+
+      const payment = await paymentRes.json();
+      const { status: mpStatus, metadata } = payment;
+
+      const salonId = metadata?.salon_id as string | undefined;
+      const orderId = metadata?.order_id as string | undefined;
+
+      if (!salonId || !orderId) {
+        console.warn("MP webhook: metadata incompleto", metadata);
+        return res.status(200).json({ received: true });
+      }
+
+      const orderRef = adminDb.doc(`salons/${salonId}/orders/${orderId}`);
+      const orderSnap = await orderRef.get();
+
+      if (!orderSnap.exists) {
+        console.warn(`MP webhook: pedido não encontrado salon=${salonId} order=${orderId}`);
+        return res.status(200).json({ received: true });
+      }
+
+      const orderData = orderSnap.data() as any;
+
+      if (mpStatus === "approved") {
+        if (orderData?.status === "PAID") {
+          return res.status(200).json({ received: true });
+        }
+
+        await orderRef.set(
+          {
+            status: "PAID",
+            paymentId: String(paymentId),
+            mpPaymentStatus: mpStatus,
+            paidAt: Date.now(),
+            updatedAt: Date.now(),
+          },
+          { merge: true }
+        );
+
+        const items = Array.isArray(orderData?.items) ? orderData.items : [];
+        const batch = adminDb.batch();
+
+        for (const item of items) {
+          if (!item?.productId || !item?.quantity) continue;
+          const productRef = adminDb.doc(`salons/${salonId}/products/${item.productId}`);
+          batch.set(productRef, { stock: FieldValue.increment(-Number(item.quantity)), updatedAt: Date.now() }, { merge: true });
+        }
+
+        await batch.commit();
+
+        await adminDb.collection("billing_events").add({
+          salonId,
+          type: "STORE_ORDER_PAID",
+          status: "SUCCESS",
+          metadata: { orderId, paymentId: String(paymentId), gateway: "mercadopago" },
+          createdAt: Date.now(),
+        });
+
+        console.log(`[MP] Pedido pago: salon=${salonId} order=${orderId} payment=${paymentId}`);
+      } else if (["cancelled", "rejected", "refunded", "charged_back"].includes(mpStatus)) {
+        await orderRef.set(
+          {
+            status: "CANCELLED",
+            mpPaymentStatus: mpStatus,
+            updatedAt: Date.now(),
+          },
+          { merge: true }
+        );
+
+        console.log(`[MP] Pedido cancelado/recusado: salon=${salonId} order=${orderId} status=${mpStatus}`);
+      }
+
+      return res.status(200).json({ received: true });
+    } catch (error) {
+      console.error("[MP] Erro no webhook:", error);
+      return res.status(200).json({ received: true });
+    }
+  });
+
+  app.use(express.json());
+
+  // ─── Rotas da API ────────────────────────────────────────────────────────
+
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok", message: "Bella & Chic API is running" });
+  });
+
+  // Bootstrap Super Admin
+  app.post("/api/bootstrap-admin", authenticateUser, async (req, res) => {
+    const user = (req as any).user;
+    const superAdminEmail = process.env.SUPER_ADMIN_EMAIL || "icaromoreira1313@gmail.com";
+
+    if (user.email === superAdminEmail && user.email_verified) {
+      try {
+        await adminAuth.setCustomUserClaims(user.uid, { superAdmin: true });
+
+        await adminDb.collection("users").doc(user.uid).set(
+          {
+            role: "SUPER_ADMIN",
+            updatedAt: Date.now(),
+          },
+          { merge: true }
+        );
+
+        return res.json({ success: true, message: "Super Admin privileges granted." });
+      } catch (error) {
+        console.error("Error bootstrapping admin:", error);
+        return res.status(500).json({ error: "Failed to bootstrap admin" });
+      }
+    }
+
+    return res.status(403).json({ error: "Unauthorized to claim Super Admin" });
+  });
+
+  // ─── Gestão de usuários (Super Admin) ───────────────────────────────────
+  app.get("/api/admin/users", authenticateUser, async (req, res) => {
+    const requester = (req as any).user;
+    try {
+      const requesterProfile = await getRequestUserProfile(requester.uid);
+      if (!requesterProfile || requesterProfile.role !== "SUPER_ADMIN") {
+        return res.status(403).json({ error: "Apenas o Super Admin pode listar usuários" });
+      }
+      const snapshot = await adminDb.collection("users").orderBy("createdAt", "desc").limit(1000).get();
+      const users = snapshot.docs.map((d) => ({ uid: d.id, ...d.data() }));
+      return res.json({ users });
+    } catch (error: any) {
+      console.error("[admin/users GET] Erro:", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.delete("/api/admin/users/:uid", authenticateUser, async (req, res) => {
+    const requester = (req as any).user;
+    const targetUid = String(req.params.uid || "").trim();
+
+    if (!targetUid) {
+      return res.status(400).json({ error: "UID do usuário é obrigatório" });
+    }
+
+    try {
+      const requesterProfile = await getRequestUserProfile(requester.uid);
+
+      if (!requesterProfile || requesterProfile.role !== "SUPER_ADMIN") {
+        return res.status(403).json({ error: "Apenas o Super Admin pode excluir usuários" });
+      }
+
+      if (requester.uid === targetUid) {
+        return res.status(400).json({ error: "Você não pode excluir sua própria conta por este painel" });
+      }
+
+      const targetUserRef = adminDb.collection("users").doc(targetUid);
+      const targetUserSnap = await targetUserRef.get();
+
+      if (!targetUserSnap.exists) {
+        return res.status(404).json({ error: "Usuário não encontrado" });
+      }
+
+      const targetUser = targetUserSnap.data() as any;
+
+      if (targetUser?.role === "SUPER_ADMIN") {
+        return res.status(400).json({ error: "Não é permitido excluir outro Super Admin por este painel" });
+      }
+
+      const ownedSalons = await adminDb.collection("salons").where("ownerId", "==", targetUid).limit(1).get();
+      if (!ownedSalons.empty) {
+        return res.status(409).json({
+          error: "Este usuário é dono de um salão. Transfira a propriedade ou remova o salão antes de excluir a conta.",
+        });
+      }
+
+      const professionalRefs = await adminDb
+        .collectionGroup("professionals")
+        .where("userId", "==", targetUid)
+        .get();
+
+      const batch = adminDb.batch();
+      professionalRefs.docs.forEach((professionalDoc) => batch.delete(professionalDoc.ref));
+      batch.delete(targetUserRef);
+      await batch.commit();
+
+      try {
+        await adminAuth.deleteUser(targetUid);
+      } catch (error: any) {
+        if (error?.code !== "auth/user-not-found") {
+          throw error;
+        }
+      }
+
+      return res.json({ success: true });
+    } catch (error: any) {
+      console.error("Error deleting user:", error);
+      return res.status(500).json({ error: error.message || "Erro ao excluir usuário" });
+    }
+  });
+
+  // ─── Stripe: Portal do cliente (gerenciar/cancelar assinatura) ──────────
+  app.post("/api/create-portal-session", authenticateUser, async (req, res) => {
+    if (!stripe) {
+      return res.status(400).json({ error: "Stripe not configured" });
+    }
+
+    const user = (req as any).user;
+    const { returnUrl } = req.body;
+
+    try {
+      const userDoc = await adminDb.collection("users").doc(user.uid).get();
+      const userData = userDoc.data();
+
+      if (!userData?.salonId) {
+        return res.status(400).json({ error: "Salão não encontrado para este usuário" });
+      }
+
+      const subSnap = await adminDb
+        .collection("subscriptions")
+        .where("salonId", "==", userData.salonId)
+        .orderBy("createdAt", "desc")
+        .limit(1)
+        .get();
+
+      if (subSnap.empty) {
+        return res.status(404).json({ error: "Nenhuma assinatura encontrada para este salão" });
+      }
+
+      const customerId = subSnap.docs[0].data()?.customerId;
+      if (!customerId) {
+        return res.status(404).json({ error: "ID do cliente Stripe não encontrado" });
+      }
+
+      const session = await stripe.billingPortal.sessions.create({
+        customer: customerId,
+        return_url: returnUrl || APP_URL,
+      });
+
+      return res.json({ url: session.url });
+    } catch (error: any) {
+      console.error("[portal] Erro:", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ─── Stripe: Checkout de assinatura SaaS ────────────────────────────────
+  app.post("/api/create-checkout-session", authenticateUser, async (req, res) => {
+    if (!stripe) {
+      return res.status(400).json({ error: "Stripe not configured" });
+    }
+
+    const { priceId, salonId, salonSlug, successUrl, cancelUrl } = req.body;
+    const user = (req as any).user;
+
+    try {
+      const userDoc = await adminDb.collection("users").doc(user.uid).get();
+      const userData = userDoc.data();
+
+      if (!userData) {
+        return res.status(403).json({ error: "User not found in database" });
+      }
+
+      if (userData.role !== "SUPER_ADMIN" && userData.salonId !== salonId) {
+        return res.status(403).json({ error: "Unauthorized: You do not have permission for this salon" });
+      }
+
+      // Verifica desconto de afiliado para este salão
+      const salonDocForDiscount = await adminDb.collection("salons").doc(salonId).get();
+      const salonDataForDiscount = salonDocForDiscount.data() as any;
+      let discountCoupon: string | undefined;
+
+      const affiliateRef = salonDataForDiscount?.affiliateRef;
+      const affiliateApplied = salonDataForDiscount?.affiliateDiscountApplied;
+      const referralCredits = salonDataForDiscount?.referralCredits || 0;
+
+      // Desconto por ser indicado (1º pagamento) ou por ter indicado outros
+      const newUserDiscount = affiliateRef && !affiliateApplied ? (salonDataForDiscount?.affiliateDiscountPct || 0) : 0;
+      const referralDiscount = Math.min(referralCredits * 15, 50);
+      const finalDiscount = Math.max(newUserDiscount, referralDiscount);
+
+      if (finalDiscount > 0 && stripe) {
+        try {
+          // Cria um cupom Stripe one-off com o percentual calculado
+          const coupon = await stripe.coupons.create({
+            percent_off: finalDiscount,
+            duration: "once",
+            name: affiliateRef
+              ? `Desconto indicação ${affiliateRef} (${finalDiscount}%)`
+              : `Desconto fidelidade (${finalDiscount}%)`,
+            metadata: { salonId, affiliateRef: affiliateRef || "fidelidade", discountType: newUserDiscount > 0 ? "new_user" : "referral" },
+          });
+          discountCoupon = coupon.id;
+        } catch (e) {
+          console.warn("[Affiliate] Erro ao criar cupom Stripe:", e);
+        }
+      }
+
+      const session = await stripe.checkout.sessions.create({
+        line_items: [{ price: priceId, quantity: 1 }],
+        mode: "subscription",
+        success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: cancelUrl,
+        ...(discountCoupon ? { discounts: [{ coupon: discountCoupon }] } : {}),
+        metadata: {
+          kind: "subscription",
+          salonId,
+          salonSlug,
+          priceId,
+          affiliateRef: affiliateRef || "",
+          discountApplied: finalDiscount > 0 ? String(finalDiscount) : "0",
+        },
+      });
+
+      return res.json({ url: session.url });
+    } catch (error: any) {
+      console.error("Error creating subscription checkout session:", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ─── Mercado Pago: Checkout da loja (SEM LOGIN OBRIGATÓRIO) ─────────────
+  app.post("/api/create-mp-checkout", async (req, res) => {
+    if (!MP_ACCESS_TOKEN) {
+      return res.status(400).json({ error: "Mercado Pago não configurado. Adicione MERCADOPAGO_ACCESS_TOKEN no .env" });
+    }
+
+    const authHeader = req.headers.authorization;
+    let decodedUser: any = null;
+
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      try {
+        decodedUser = await adminAuth.verifyIdToken(authHeader.split("Bearer ")[1]);
+      } catch {
+        // token inválido — tudo bem, segue como convidado
+      }
+    }
+
+    const { salonId, orderId, salonSlug, successUrl, cancelUrl } = req.body;
+
+    if (!salonId || !orderId || !salonSlug || !successUrl || !cancelUrl) {
+      return res.status(400).json({ error: "Campos obrigatórios faltando" });
+    }
+
+    try {
+      const orderRef = adminDb.doc(`salons/${salonId}/orders/${orderId}`);
+      const orderSnap = await orderRef.get();
+
+      if (!orderSnap.exists) {
+        return res.status(404).json({ error: "Pedido não encontrado" });
+      }
+
+      const orderData = orderSnap.data() as any;
+
+      if (decodedUser) {
+        const userDoc = await adminDb.collection("users").doc(decodedUser.uid).get();
+        const userData = userDoc.data();
+
+        if (userData) {
+          const isSuperAdmin = userData.role === "SUPER_ADMIN";
+          const isSalonAdmin = userData.role === "SALON_ADMIN" && userData.salonId === salonId;
+          const isOrderOwner = orderData.clientId === decodedUser.uid;
+
+          if (!isSuperAdmin && !isSalonAdmin && !isOrderOwner) {
+            return res.status(403).json({ error: "Sem permissão para este pedido" });
+          }
+        }
+      } else {
+        if (!String(orderData.clientId || "").startsWith("guest_")) {
+          return res.status(403).json({ error: "Checkout de convidado não permitido para este pedido" });
+        }
+      }
+
+      if (!Array.isArray(orderData.items) || orderData.items.length === 0) {
+        return res.status(400).json({ error: "Pedido sem itens" });
+      }
+
+      const mpItems = orderData.items.map((item: any) => ({
+        id: item.productId || item.variantId || "produto",
+        title: item.name || "Produto",
+        quantity: Number(item.quantity) || 1,
+        unit_price: Number(Number(item.price).toFixed(2)),
+        currency_id: "BRL",
+        picture_url: item.image || undefined,
+      }));
+
+      if (Number(orderData.shippingFee) > 0) {
+        mpItems.push({
+          id: "frete",
+          title: "Frete",
+          quantity: 1,
+          unit_price: Number(Number(orderData.shippingFee).toFixed(2)),
+          currency_id: "BRL",
+        });
+      }
+
+      const preference = {
+        items: mpItems,
+        payer: {
+          name: orderData.customerName || undefined,
+          email: orderData.customerEmail || undefined,
+          phone: orderData.customerPhone
+            ? { number: orderData.customerPhone }
+            : undefined,
+        },
+        back_urls: {
+          success: `${successUrl}`,
+          failure: `${cancelUrl}&mp_status=failure`,
+          pending: `${cancelUrl}&mp_status=pending`,
+        },
+        auto_return: "approved" as const,
+        notification_url: `${APP_URL}/api/mp-webhook`,
+        external_reference: `${salonId}__${orderId}`,
+        metadata: {
+          salon_id: salonId,
+          order_id: orderId,
+          salon_slug: salonSlug,
+        },
+        statement_descriptor: "BELLA E CHIC",
+      };
+
+      const mpResponse = await createMpPreference(preference);
+
+      await orderRef.set(
+        {
+          mpPreferenceId: mpResponse.id,
+          mpExternalReference: `${salonId}__${orderId}`,
+          updatedAt: Date.now(),
+        },
+        { merge: true }
+      );
+
+      const checkoutUrl =
+        process.env.NODE_ENV === "production"
+          ? mpResponse.init_point
+          : mpResponse.sandbox_init_point || mpResponse.init_point;
+
+      return res.json({ url: checkoutUrl, preferenceId: mpResponse.id });
+    } catch (error: any) {
+      console.error("[MP] Erro ao criar preferência:", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ─── NOVA ROTA: Criar profissional com login ────────────────────────────
+  app.post("/api/admin/create-professional-user", authenticateUser, async (req, res) => {
+    const { email, password, displayName, salonId, specialties, bio, photoURL } = req.body;
+    const requester = (req as any).user;
+
+    if (!email || !password || !displayName || !salonId) {
+      return res.status(400).json({ error: "Campos obrigatórios faltando" });
+    }
+
+    try {
+      const requesterProfile = await getRequestUserProfile(requester.uid);
+      if (requesterProfile?.role !== "SALON_ADMIN" || requesterProfile.salonId !== salonId) {
+        return res.status(403).json({ error: "Apenas o administrador do salão pode criar profissionais" });
+      }
+
+      const salonDoc = await adminDb.collection("salons").doc(salonId).get();
+      const salonName = salonDoc.exists ? salonDoc.data()?.name : "o salão";
+
+      const userRecord = await adminAuth.createUser({
+        email,
+        password,
+        displayName,
+      });
+
+      await adminDb.collection("users").doc(userRecord.uid).set({
+        uid: userRecord.uid,
+        email,
+        displayName,
+        role: "PROFESSIONAL",
+        salonId,
+        createdAt: Date.now(),
+      });
+
+      const professionalData = {
+        userId: userRecord.uid,
+        displayName,
+        bio: bio || "",
+        specialties: specialties || [],
+        active: true,
+        photoURL: photoURL || "",
+        salonId,
+      };
+      await adminDb.collection(`salons/${salonId}/professionals`).add(professionalData);
+
+      await sendEmail({
+          to: email,
+          subject: `Bem-vindo(a) à equipe do ${salonName}`,
+          html: `
+            <div style="font-family: sans-serif; max-width: 500px; margin: 0 auto;">
+              <h2>Olá ${displayName},</h2>
+              <p>Você foi adicionado como profissional no salão <strong>${salonName}</strong>.</p>
+              <p>Suas credenciais de acesso são:</p>
+              <ul>
+                <li><strong>Email:</strong> ${email}</li>
+                <li><strong>Senha:</strong> ${password}</li>
+              </ul>
+              <p>Acesse: ${APP_URL}/login</p>
+              <p>Recomendamos trocar sua senha no primeiro acesso.</p>
+              <hr />
+              <p style="font-size: 12px; color: #666;">Este é um e-mail automático, por favor não responda.</p>
+            </div>
+          `,
+        });
+
+      res.json({ success: true, uid: userRecord.uid });
+    } catch (error: any) {
+      console.error("Erro ao criar profissional:", error);
+      res.status(500).json({ error: error.message || "Erro ao criar profissional" });
+    }
+  });
+
+  // ─── Onboarding: promover usuário a SALON_ADMIN após criar salão ────────
+  app.post("/api/onboarding/promote", authenticateUser, async (req, res) => {
+    const user = (req as any).user;
+    const { salonId, trialDays = 14 } = req.body;
+
+    if (!salonId) {
+      return res.status(400).json({ error: "salonId é obrigatório" });
+    }
+
+    try {
+      // Verifica se o salão existe e pertence ao usuário
+      const salonDoc = await adminDb.collection("salons").doc(salonId).get();
+      if (!salonDoc.exists) {
+        return res.status(404).json({ error: "Salão não encontrado" });
+      }
+
+      const salonData = salonDoc.data();
+      if (salonData?.ownerId !== user.uid) {
+        return res.status(403).json({ error: "Você não é o dono deste salão" });
+      }
+
+      const now = Date.now();
+
+      // Atualiza o role para SALON_ADMIN usando Admin SDK
+      await adminDb.collection("users").doc(user.uid).set(
+        { salonId, role: "SALON_ADMIN", updatedAt: now },
+        { merge: true }
+      );
+
+      // Cria o registro de assinatura inicial (frontend não tem permissão)
+      await adminDb.collection("subscriptions").add({
+        salonId,
+        planId: "FREE_TRIAL",
+        status: "ACTIVE",
+        currentPeriodStart: now,
+        currentPeriodEnd: now + (trialDays * 24 * 60 * 60 * 1000),
+        cancelAtPeriodEnd: false,
+        createdAt: now,
+      });
+
+      // Registra evento de cobrança
+      await adminDb.collection("billing_events").add({
+        salonId,
+        type: "TRIAL_STARTED",
+        status: "SUCCESS",
+        createdAt: now,
+      });
+
+      return res.json({ success: true });
+    } catch (error: any) {
+      console.error("[onboarding/promote]", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ─── WhatsApp: conectar instância por salão (QR Code) ───────────────────
+  // Cada salão tem sua própria instância na Evolution API: "salon_{salonId}"
+  // O admin escaneia o QR Code pela tela de Configurações → WhatsApp
+
+  // Inicia conexão e retorna o QR Code em base64
+  app.post("/api/whatsapp/connect", authenticateUser, async (req, res) => {
+    if (!EVOLUTION_URL || !EVOLUTION_API_KEY) {
+      return res.status(503).json({ error: "Evolution API não configurada no servidor." });
+    }
+    const requester = (req as any).user;
+    try {
+      const profile = await getRequestUserProfile(requester.uid);
+      if (!profile?.salonId) return res.status(403).json({ error: "Salão não encontrado." });
+      const instanceName = `salon_${profile.salonId}`;
+
+      // Tenta criar a instância (ignora erro se já existir)
+      await fetch(`${EVOLUTION_URL}/instance/create`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "apikey": EVOLUTION_API_KEY },
+        body: JSON.stringify({ instanceName, qrcode: true }),
+      });
+
+      // Busca o QR Code
+      const qrRes = await fetch(`${EVOLUTION_URL}/instance/connect/${instanceName}`, {
+        headers: { "apikey": EVOLUTION_API_KEY },
+      });
+      const qrData = await qrRes.json();
+
+      return res.json({
+        qrcode: qrData?.base64 || qrData?.qrcode?.base64 || null,
+        status: qrData?.instance?.state || "connecting",
+      });
+    } catch (error: any) {
+      console.error("[WhatsApp connect]", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Verifica status da conexão
+  app.get("/api/whatsapp/status", authenticateUser, async (req, res) => {
+    if (!EVOLUTION_URL || !EVOLUTION_API_KEY) {
+      return res.json({ connected: false, reason: "not_configured" });
+    }
+    const requester = (req as any).user;
+    try {
+      const profile = await getRequestUserProfile(requester.uid);
+      if (!profile?.salonId) return res.status(403).json({ error: "Salão não encontrado." });
+      const instanceName = `salon_${profile.salonId}`;
+
+      const statusRes = await fetch(
+        `${EVOLUTION_URL}/instance/connectionState/${instanceName}`,
+        { headers: { "apikey": EVOLUTION_API_KEY } }
+      );
+      const statusData = await statusRes.json();
+      const state = statusData?.instance?.state || statusData?.state || "close";
+
+      return res.json({ connected: state === "open", state });
+    } catch (error: any) {
+      return res.json({ connected: false, state: "close" });
+    }
+  });
+
+  // Desconecta e deleta a instância
+  app.post("/api/whatsapp/disconnect", authenticateUser, async (req, res) => {
+    if (!EVOLUTION_URL || !EVOLUTION_API_KEY) {
+      return res.status(503).json({ error: "Evolution API não configurada." });
+    }
+    const requester = (req as any).user;
+    try {
+      const profile = await getRequestUserProfile(requester.uid);
+      if (!profile?.salonId) return res.status(403).json({ error: "Salão não encontrado." });
+      const instanceName = `salon_${profile.salonId}`;
+
+      await fetch(`${EVOLUTION_URL}/instance/logout/${instanceName}`, {
+        method: "DELETE",
+        headers: { "apikey": EVOLUTION_API_KEY },
+      });
+      return res.json({ success: true });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ─── PIX via Asaas ─────────────────────────────────────────────────────────
+  // ─── Push Notifications: subscribe / unsubscribe ────────────────────────────
+  app.post("/api/push/subscribe", async (req, res) => {
+    const { subscription, userId, salonId, role } = req.body;
+    if (!subscription || !subscription.endpoint) {
+      return res.status(400).json({ error: "Subscription inválida" });
+    }
+    try {
+      // Usa o endpoint como ID único (cada dispositivo/browser tem um endpoint único)
+      const docId = Buffer.from(subscription.endpoint).toString('base64').slice(0, 100);
+      await adminDb.collection("push_subscriptions").doc(docId).set({
+        subscription,
+        userId:   userId  || null,
+        salonId:  salonId || null,
+        role:     role    || 'CLIENT',
+        updatedAt: Date.now(),
+      }, { merge: true });
+      return res.json({ ok: true });
+    } catch (e: any) {
+      console.error("[Push Subscribe]", e);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/push/unsubscribe", async (req, res) => {
+    const { endpoint, userId } = req.body;
+    if (!endpoint) return res.status(400).json({ error: "Endpoint ausente" });
+    try {
+      const docId = Buffer.from(endpoint).toString('base64').slice(0, 100);
+      await adminDb.collection("push_subscriptions").doc(docId).delete();
+      return res.json({ ok: true });
+    } catch (e: any) {
+      console.error("[Push Unsubscribe]", e);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ─── Push: envia notificação de teste (usado no painel admin) ────────────────
+  app.post("/api/push/test", async (req, res) => {
+    const { salonId } = req.body;
+    if (!salonId) return res.status(400).json({ error: "salonId ausente" });
+    try {
+      await sendPushToSalon(salonId, {
+        title: '🔔 Notificações funcionando!',
+        body: 'Você receberá alertas de novos agendamentos e pedidos aqui.',
+        requireInteraction: false,
+        tag: 'push-test',
+      });
+      return res.json({ ok: true });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/pix/create", async (req, res) => {
+    const { salonId, order, salonSlug } = req.body;
+    if (!salonId || !order) return res.status(400).json({ error: "Dados faltando" });
+
+    const asaasKey = process.env.ASAAS_API_KEY;
+    if (!asaasKey) return res.status(400).json({ error: "ASAAS_API_KEY não configurado" });
+
+    try {
+      // 1. Cria pedido no Firestore com status AWAITING_PIX
+      const orderRef = await adminDb.collection(`salons/${salonId}/orders`).add({
+        ...order,
+        salonId,
+        status: "AWAITING_PIX",
+        paymentMethod: "PIX",
+        pixExpiresAt: Date.now() + 30 * 60 * 1000, // 30 min
+      });
+
+      // 2. Cria ou busca cliente no Asaas
+      let asaasCustomerId = "";
+      try {
+        const cpfCnpj = order.customerPhone?.replace(/\D/g, "").slice(0, 11) || "";
+        const customerRes = await fetch("https://api.asaas.com/v3/customers", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "access_token": asaasKey },
+          body: JSON.stringify({
+            name: order.customerName || "Cliente",
+            email: order.customerEmail || undefined,
+            phone: order.customerPhone || undefined,
+            cpfCnpj: cpfCnpj.length >= 11 ? cpfCnpj : undefined,
+          }),
+        });
+        const customerData = await customerRes.json();
+        asaasCustomerId = customerData.id;
+      } catch (e) {
+        console.warn("[Asaas] Erro ao criar cliente:", e);
+      }
+
+      // 3. Cria cobrança PIX no Asaas
+      const dueDate = new Date();
+      dueDate.setMinutes(dueDate.getMinutes() + 30);
+      const dueDateStr = dueDate.toISOString().split("T")[0];
+
+      const chargeRes = await fetch("https://api.asaas.com/v3/payments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "access_token": asaasKey },
+        body: JSON.stringify({
+          customer: asaasCustomerId || undefined,
+          billingType: "PIX",
+          value: Number(order.totalAmount.toFixed(2)),
+          dueDate: dueDateStr,
+          description: `Pedido #${orderRef.id.slice(-6).toUpperCase()} — ${salonSlug}`,
+          externalReference: `${salonId}__${orderRef.id}`,
+        }),
+      });
+      const charge = await chargeRes.json();
+      if (!charge.id) throw new Error(charge.errors?.[0]?.description || "Erro Asaas");
+
+      // 4. Busca QR Code
+      const qrRes = await fetch(`https://api.asaas.com/v3/payments/${charge.id}/pixQrCode`, {
+        headers: { "access_token": asaasKey },
+      });
+      const qrData = await qrRes.json();
+
+      // 5. Atualiza pedido com dados do PIX
+      await orderRef.update({
+        asaasPaymentId: charge.id,
+        pixQrCode: qrData.encodedImage || "",
+        pixQrCodeBase64: qrData.encodedImage || "",
+        pixCopyPaste: qrData.payload || "",
+      });
+
+      return res.json({
+        orderId: orderRef.id,
+        qrCode: qrData.encodedImage || "",
+        qrCodeBase64: qrData.encodedImage || "",
+        copyPaste: qrData.payload || "",
+      });
+    } catch (error: any) {
+      console.error("[PIX] Erro:", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ─── PIX Simples — QR Code estático com chave do dono ──────────────────────
+  app.post("/api/pix/simple", async (req, res) => {
+    const { salonId, order, salonSlug } = req.body;
+    if (!salonId || !order) return res.status(400).json({ error: "Dados faltando" });
+
+    try {
+      // Busca chave PIX do dono nas settings do salão
+      const businessDoc = await adminDb.doc(`salons/${salonId}/settings/business`).get();
+      const business = businessDoc.data() as any;
+      const pixKey = business?.pixKey;
+      const pixOwnerName = business?.pixOwnerName || "Recebedor";
+
+      if (!pixKey) {
+        return res.status(400).json({ error: "Chave PIX não configurada neste salão" });
+      }
+
+      // Cria pedido com status AWAITING_PIX
+      const orderRef = await adminDb.collection(`salons/${salonId}/orders`).add({
+        ...order,
+        salonId,
+        status: "AWAITING_PIX",
+        paymentMethod: "PIX",
+        pixMode: "simple",
+        pixExpiresAt: Date.now() + 24 * 60 * 60 * 1000, // 24h para PIX simples
+      });
+
+      // Gera payload PIX Brasil (EMV QR Code) sem dependência externa
+      const amount = Number(order.totalAmount.toFixed(2));
+      const amountStr = amount.toFixed(2);
+      const description = `Pedido #${orderRef.id.slice(-6).toUpperCase()}`;
+      const city = (business?.city || "SAO PAULO").toUpperCase().slice(0, 15);
+      const name = pixOwnerName.toUpperCase().slice(0, 25);
+
+      // Monta o payload PIX EMV
+      function crc16(str: string): string {
+        let crc = 0xFFFF;
+        for (let i = 0; i < str.length; i++) {
+          crc ^= str.charCodeAt(i) << 8;
+          for (let j = 0; j < 8; j++) {
+            crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+          }
+        }
+        return (crc & 0xFFFF).toString(16).toUpperCase().padStart(4, "0");
+      }
+
+      function emv(id: string, value: string): string {
+        return `${id}${String(value.length).padStart(2, "0")}${value}`;
+      }
+
+      const gui = "BR.GOV.BCB.PIX";
+      const pixKeyField = emv("01", pixKey);
+      const infoAdicional = emv("02", description.slice(0, 72));
+      const merchantAccount = emv("26", emv("00", gui) + pixKeyField + infoAdicional);
+      const txid = "***";
+
+      let payload =
+        emv("00", "01") +                          // Payload Format Indicator
+        merchantAccount +                           // Merchant Account Information
+        emv("52", "0000") +                        // Merchant Category Code
+        emv("53", "986") +                         // Transaction Currency (BRL)
+        emv("54", amountStr) +                     // Transaction Amount
+        emv("58", "BR") +                          // Country Code
+        emv("59", name) +                          // Merchant Name
+        emv("60", city) +                          // Merchant City
+        emv("62", emv("05", txid));                // Additional Data Field
+
+      payload += emv("63", crc16(payload + "6304")); // CRC16
+
+      await orderRef.update({ pixCopyPaste: payload });
+
+      // Notifica dono
+      fetch("/api/order/notify-owner", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          salonId,
+          orderId: orderRef.id,
+          order: { ...order, id: orderRef.id, paymentMethod: "PIX" },
+          salonSlug,
+        }),
+      }).catch(() => {});
+
+      return res.json({
+        orderId: orderRef.id,
+        copyPaste: payload,
+        pixOwnerName,
+        pixKey,
+      });
+    } catch (error: any) {
+      console.error("[PIX Simple]", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ─── Upload de comprovante PIX Simples ─────────────────────────────────────
+  app.post("/api/pix/upload-comprovante", upload.single('file'), async (req: any, res) => {
+    const { orderId } = req.body;
+    const file = req.file;
+    if (!orderId || !file) return res.status(400).json({ error: "Dados faltando" });
+
+    try {
+      // Busca o pedido para saber o salonId
+      const orderSnaps = await adminDb.collectionGroup("orders")
+        .where("__name__", ">=", "")
+        .get().catch(() => null);
+
+      // Busca o pedido diretamente pelo collectionGroup
+      let orderDoc: any = null;
+      let salonIdFound = "";
+      const allOrders = await adminDb.collectionGroup("orders").get();
+      for (const d of allOrders.docs) {
+        if (d.id === orderId) {
+          orderDoc = d;
+          salonIdFound = d.ref.path.split("/")[1];
+          break;
+        }
+      }
+
+      if (!orderDoc) return res.status(404).json({ error: "Pedido não encontrado" });
+
+      // Salva base64 do comprovante no Firestore (até 1MB funciona bem)
+      if (file.size <= 1024 * 1024) {
+        const base64 = file.buffer.toString('base64');
+        await orderDoc.ref.update({
+          comprovanteBase64: base64,
+          comprovanteMimeType: file.mimetype,
+          comprovanteUploadedAt: Date.now(),
+          status: "AWAITING_PIX", // mantém aguardando confirmação manual
+        });
+      } else {
+        // Para arquivos maiores, salva só o nome e marca como recebido
+        await orderDoc.ref.update({
+          comprovanteNome: file.originalname,
+          comprovanteUploadedAt: Date.now(),
+        });
+      }
+
+      // Notifica o dono do salão que tem comprovante para conferir
+      const businessDoc = await adminDb.doc(`salons/${salonIdFound}/settings/business`).get();
+      const business = businessDoc.data() as any;
+      if (business?.whatsapp) {
+        await sendWhatsApp(business.whatsapp,
+          `📎 Comprovante recebido!\n\nUm cliente enviou o comprovante do PIX para o pedido *#${orderId.slice(-6).toUpperCase()}*.\n\nAcesse o painel para conferir e confirmar o pagamento.`,
+          `salon_${salonIdFound}`
+        );
+      }
+
+      return res.json({ ok: true });
+    } catch (error: any) {
+      console.error("[Comprovante]", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ─── Verificar pagamento PIX ────────────────────────────────────────────────
+  app.get("/api/pix/check-payment", async (req, res) => {
+    const { orderId } = req.query as { orderId: string };
+    if (!orderId) return res.status(400).json({ error: "orderId obrigatório" });
+
+    const asaasKey = process.env.ASAAS_API_KEY;
+    if (!asaasKey) return res.json({ paid: false });
+
+    try {
+      // Busca o pedido em todos os salões via collectionGroup
+      const snap = await adminDb.collectionGroup("orders")
+        .where(adminDb.app.options.projectId ? "__name__" : "asaasPaymentId", "!=", "")
+        .get().catch(() => null);
+
+      // Busca direta por ID se soubermos o salonId
+      // Neste caso o frontend deve passar salonId também — simplificamos buscando pelo asaasPaymentId
+      const orderSnaps = await adminDb.collectionGroup("orders")
+        .where("asaasPaymentId", "!=", "")
+        .get();
+
+      let orderDoc: any = null;
+      let salonIdFound = "";
+      for (const d of orderSnaps.docs) {
+        const path = d.ref.path.split("/");
+        if (d.id === orderId || d.ref.path.includes(orderId)) {
+          orderDoc = d;
+          salonIdFound = path[1];
+          break;
+        }
+      }
+
+      if (!orderDoc) return res.json({ paid: false });
+      const orderData = orderDoc.data();
+      const asaasId = orderData.asaasPaymentId;
+
+      const payRes = await fetch(`https://api.asaas.com/v3/payments/${asaasId}`, {
+        headers: { "access_token": asaasKey },
+      });
+      const payment = await payRes.json();
+
+      if (payment.status === "RECEIVED" || payment.status === "CONFIRMED") {
+        await orderDoc.ref.update({ status: "PAID", paidAt: Date.now() });
+        // Desconta estoque
+        const items = orderData.items || [];
+        const batch = adminDb.batch();
+        for (const item of items) {
+          if (item.productId) {
+            const ref = adminDb.doc(`salons/${salonIdFound}/products/${item.productId}`);
+            batch.update(ref, { stock: FieldValue.increment(-Number(item.quantity)) });
+          }
+        }
+        await batch.commit();
+        return res.json({ paid: true });
+      }
+      return res.json({ paid: false, status: payment.status });
+    } catch (error: any) {
+      console.error("[PIX Check]", error);
+      return res.json({ paid: false });
+    }
+  });
+
+  // ─── Webhook Asaas (confirmação automática de PIX) ──────────────────────────
+  app.post("/api/asaas-webhook", express.json(), async (req, res) => {
+    const { event, payment } = req.body;
+    if (!["PAYMENT_RECEIVED", "PAYMENT_CONFIRMED"].includes(event)) {
+      return res.json({ received: true });
+    }
+    try {
+      const externalRef = payment?.externalReference as string;
+      if (!externalRef || !externalRef.includes("__")) return res.json({ received: true });
+      const [salonId, orderId] = externalRef.split("__");
+      const orderRef = adminDb.doc(`salons/${salonId}/orders/${orderId}`);
+      const orderSnap = await orderRef.get();
+      if (!orderSnap.exists || orderSnap.data()?.status === "PAID") return res.json({ received: true });
+
+      await orderRef.update({ status: "PAID", paidAt: Date.now(), updatedAt: Date.now() });
+
+      // Desconta estoque
+      const items = orderSnap.data()?.items || [];
+      const batch = adminDb.batch();
+      for (const item of items) {
+        if (item.productId) {
+          batch.update(adminDb.doc(`salons/${salonId}/products/${item.productId}`), {
+            stock: FieldValue.increment(-Number(item.quantity))
+          });
+        }
+      }
+      await batch.commit();
+      console.log(`[Asaas Webhook] PIX confirmado: ${salonId}/${orderId}`);
+    } catch (e) {
+      console.error("[Asaas Webhook]", e);
+    }
+    return res.json({ received: true });
+  });
+
+  // ─── Disponibilidade pública de agenda ─────────────────────────────────────
+  // Retorna apenas os horários ocupados (startTime, endTime, status) sem dados pessoais.
+  // Usado pelo frontend para bloquear slots mesmo para visitantes não logados.
+  // ─── Realocar agendamentos ao mudar intervalo da agenda ──────────────────────
+  app.post("/api/appointments/reallocate", authenticateUser, async (req, res) => {
+    const { salonId, newInterval } = req.body;
+    const user = (req as any).user;
+
+    if (!salonId || !newInterval) {
+      return res.status(400).json({ error: "salonId e newInterval obrigatórios" });
+    }
+
+    try {
+      // Verifica permissão
+      const userDoc = await adminDb.collection("users").doc(user.uid).get();
+      const userData = userDoc.data();
+      if (!userData || (userData.role !== "SUPER_ADMIN" && userData.salonId !== salonId)) {
+        return res.status(403).json({ error: "Sem permissão" });
+      }
+
+      const today = new Date().toISOString().split("T")[0];
+
+      // Busca agendamentos futuros não cancelados
+      const aptsSnap = await adminDb
+        .collection(`salons/${salonId}/appointments`)
+        .where("date", ">=", today)
+        .where("status", "in", ["PENDING", "CONFIRMED"])
+        .get();
+
+      const toMin = (t: string) => {
+        const [h, m] = t.split(":").map(Number);
+        return h * 60 + m;
+      };
+      const fromMin = (m: number) =>
+        `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+
+      let reallocated = 0;
+      const batch = adminDb.batch();
+
+      for (const doc of aptsSnap.docs) {
+        const apt = doc.data() as any;
+        const startMin = toMin(apt.startTime);
+
+        // Verifica se o horário já está no grid novo
+        if (startMin % newInterval === 0) continue;
+
+        // Encontra o slot mais próximo no grid
+        const lower = Math.floor(startMin / newInterval) * newInterval;
+        const upper = lower + newInterval;
+
+        // Busca outros agendamentos do mesmo profissional no mesmo dia para verificar conflito
+        const conflicts = aptsSnap.docs
+          .filter(d => d.id !== doc.id && d.data().professionalId === apt.professionalId && d.data().date === apt.date)
+          .map(d => d.data() as any);
+
+        const hasConflict = (candidateMin: number) => {
+          const candEnd = candidateMin + (apt.duration || 30);
+          return conflicts.some((c: any) => {
+            const cStart = toMin(c.startTime);
+            const cEnd = toMin(c.endTime || c.startTime);
+            return candidateMin < cEnd && candEnd > cStart;
+          });
+        };
+
+        // Tenta o slot mais próximo (primeiro lower, depois upper)
+        let newStart: number | null = null;
+        if (!hasConflict(lower)) {
+          newStart = lower;
+        } else if (!hasConflict(upper)) {
+          newStart = upper;
+        }
+
+        if (newStart === null) continue; // Não conseguiu realocar sem conflito
+
+        const duration = apt.duration || (toMin(apt.endTime) - startMin) || 30;
+        const newStartStr = fromMin(newStart);
+        const newEndStr = fromMin(newStart + duration);
+
+        batch.update(doc.ref, {
+          startTime: newStartStr,
+          endTime: newEndStr,
+          updatedAt: Date.now(),
+          reallocatedFrom: apt.startTime,
+        });
+        reallocated++;
+      }
+
+      await batch.commit();
+      console.log(`[Reallocate] ${reallocated} agendamentos realocados para intervalo de ${newInterval}min no salão ${salonId}`);
+      return res.json({ ok: true, reallocated });
+    } catch (e: any) {
+      console.error("[Reallocate]", e);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/availability", async (req, res) => {
+    const { salonId, professionalId, date } = req.query as Record<string, string>;
+    if (!salonId || !professionalId || !date) {
+      return res.status(400).json({ error: "salonId, professionalId e date são obrigatórios" });
+    }
+    try {
+      const snap = await adminDb
+        .collection(`salons/${salonId}/appointments`)
+        .where("professionalId", "==", professionalId)
+        .where("date", "==", date)
+        .get();
+
+      // Retorna apenas os campos necessários para checar conflito — sem dados pessoais
+      const slots = snap.docs
+        .map(d => d.data())
+        .filter(d => d.status !== "CANCELLED")
+        .map(d => ({ startTime: d.startTime, endTime: d.endTime, status: d.status }));
+
+      return res.json({ slots });
+    } catch (err) {
+      console.error("[availability]", err);
+      return res.status(500).json({ error: "Erro ao buscar disponibilidade" });
+    }
+  });
+
+  // ─── Sinal/Depósito — upload de comprovante ─────────────────────────────────
+  app.post("/api/deposit/upload-comprovante", upload.single('file'), async (req: any, res) => {
+    const { salonId, appointmentId, amount } = req.body;
+    if (!salonId || !appointmentId || !req.file) {
+      return res.status(400).json({ error: "Campos obrigatórios faltando" });
+    }
+    try {
+      // Faz upload para Cloudinary (evita limite de 1MB do Firestore)
+      const base64 = req.file.buffer.toString('base64');
+      const dataUri = `data:${req.file.mimetype};base64,${base64}`;
+
+      const formData = new FormData();
+      formData.append('file', dataUri);
+      formData.append('upload_preset', 'bella_chic_uploads');
+      formData.append('folder', 'comprovantes');
+
+      const cloudRes = await fetch('https://api.cloudinary.com/v1_1/dyddwpxfm/image/upload', {
+        method: 'POST',
+        body: formData,
+      });
+
+      let comprovanteUrl = '';
+      if (cloudRes.ok) {
+        const cloudData = await cloudRes.json() as any;
+        comprovanteUrl = cloudData.secure_url || '';
+      } else {
+        // Fallback: salva URL vazia mas ainda confirma o status
+        console.warn('[Deposit] Cloudinary upload falhou, salvando sem URL');
+      }
+
+      await adminDb
+        .collection(`salons/${salonId}/appointments`)
+        .doc(appointmentId)
+        .update({
+          depositStatus: 'PAID_PIX',
+          depositComprovanteUrl: comprovanteUrl,
+          depositPaidAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+
+      // Busca dados do agendamento
+      const aptSnap = await adminDb.collection(`salons/${salonId}/appointments`).doc(appointmentId).get();
+      const apt = aptSnap.data() as any;
+
+      // Notifica CLIENTE
+      if (apt?.customerPhone) {
+        const phone = apt.customerPhone.replace(/\D/g, '');
+        const num = phone.startsWith('55') ? phone : `55${phone}`;
+        await sendWhatsApp(num,
+          `Olá, ${apt.clientName}! ✅ Recebemos seu comprovante de sinal para o agendamento de *${apt.serviceName}* no dia *${apt.date}* às *${apt.startTime}*. Aguardando confirmação do salão. 😊`
+        );
+      }
+
+      // Notifica DONO DO SALÃO
+      const salonSnap = await adminDb.collection('salons').doc(salonId).get();
+      const salonData = salonSnap.data() as any;
+      if (salonData?.phone) {
+        const ownerPhone = salonData.phone.replace(/\D/g, '');
+        const ownerNum = ownerPhone.startsWith('55') ? ownerPhone : `55${ownerPhone}`;
+        await sendWhatsApp(ownerNum,
+          `💰 *Sinal recebido!*\n\nCliente: *${apt.clientName}*\nServiço: *${apt.serviceName}*\nData: *${apt.date}* às *${apt.startTime}*\nValor do sinal: *R$ ${Number(apt.depositAmount || amount).toFixed(2)}*\n\nAcesse o painel para confirmar o agendamento.`,
+          `salon_${salonId}`
+        );
+      }
+
+      console.log(`[Deposit] Comprovante recebido para apt ${appointmentId} no salão ${salonId}`);
+      return res.json({ ok: true });
+    } catch (e: any) {
+      console.error("[Deposit]", e);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ─── Sinal/Depósito — confirmar manualmente (admin) ──────────────────────────
+  app.post("/api/deposit/confirm", authenticateUser, async (req, res) => {
+    const { salonId, appointmentId } = req.body;
+    const user = (req as any).user;
+    try {
+      const userDoc = await adminDb.collection("users").doc(user.uid).get();
+      if (userDoc.data()?.salonId !== salonId && userDoc.data()?.role !== "SUPER_ADMIN") {
+        return res.status(403).json({ error: "Sem permissão" });
+      }
+      await adminDb.collection(`salons/${salonId}/appointments`).doc(appointmentId).update({
+        status: "CONFIRMED",
+        depositStatus: "PAID_PIX",
+        depositPaidAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      return res.json({ ok: true });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ─── Reserva — desconta estoque imediatamente ───────────────────────────────
+  app.post("/api/order/reserve-stock", async (req, res) => {
+    const { salonId, orderId, items } = req.body;
+    if (!salonId || !items) return res.status(400).json({ error: "Dados faltando" });
+    try {
+      const batch = adminDb.batch();
+      for (const item of items) {
+        if (item.productId && item.quantity) {
+          const ref = adminDb.doc(`salons/${salonId}/products/${item.productId}`);
+          batch.update(ref, { stock: FieldValue.increment(-Number(item.quantity)) });
+        }
+      }
+      await batch.commit();
+      return res.json({ ok: true });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ─── Cancelar pedido e restaurar estoque ────────────────────────────────────
+  app.post("/api/order/cancel", authenticateUser, async (req, res) => {
+    const { salonId, orderId } = req.body;
+    const user = (req as any).user;
+    if (!salonId || !orderId) return res.status(400).json({ error: "Dados faltando" });
+    try {
+      // Verifica permissão
+      const userDoc = await adminDb.collection("users").doc(user.uid).get();
+      const userData = userDoc.data() as any;
+      if (userData?.salonId !== salonId && userData?.role !== "SUPER_ADMIN") {
+        return res.status(403).json({ error: "Sem permissão" });
+      }
+
+      const orderRef = adminDb.doc(`salons/${salonId}/orders/${orderId}`);
+      const orderSnap = await orderRef.get();
+      if (!orderSnap.exists) return res.status(404).json({ error: "Pedido não encontrado" });
+
+      const order = orderSnap.data() as any;
+      if (order.status === "CANCELLED") return res.json({ ok: true, msg: "Já cancelado" });
+
+      const batch = adminDb.batch();
+
+      // Restaura estoque de cada item
+      if (order.items && Array.isArray(order.items)) {
+        for (const item of order.items) {
+          if (item.productId && item.quantity) {
+            const productRef = adminDb.doc(`salons/${salonId}/products/${item.productId}`);
+            batch.update(productRef, {
+              stock: FieldValue.increment(Number(item.quantity)),
+              updatedAt: Date.now(),
+            });
+          }
+        }
+      }
+
+      // Cancela o pedido
+      batch.update(orderRef, { status: "CANCELLED", cancelledAt: Date.now(), updatedAt: Date.now() });
+      await batch.commit();
+
+      console.log(`[Order] Pedido ${orderId} cancelado — estoque restaurado (${order.items?.length || 0} itens)`);
+      return res.json({ ok: true });
+    } catch (e: any) {
+      console.error("[Order Cancel]", e);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ─── Notificação WhatsApp por evento de agendamento ─────────────────────────
+  // Chamado pelo frontend quando o status de um agendamento muda.
+  // Envia mensagem ao cliente (e/ou profissional) via Evolution API.
+  app.post("/api/appointments/notify-event", async (req, res) => {
+    const { salonId, appointmentId, newStatus, appointment } = req.body;
+    if (!salonId || !newStatus || !appointment) {
+      return res.status(400).json({ error: "Dados insuficientes" });
+    }
+
+    try {
+      // Busca dados do salão para personalizar a mensagem e obter instância WA
+      const businessDoc = await adminDb.doc(`salons/${salonId}/settings/business`).get();
+      const business = businessDoc.data() as any;
+      const salonName = business?.name || "Seu salão";
+
+      const clientPhone: string = appointment.customerPhone || "";
+      const clientName: string  = appointment.clientName    || "Cliente";
+      const serviceName: string = appointment.serviceName   || "Serviço";
+      const profName: string    = appointment.professionalName || "Profissional";
+      const dateStr: string     = appointment.date          || "";
+      const startTime: string   = appointment.startTime     || "";
+
+      // Formata data BR
+      let dataBR = dateStr;
+      if (dateStr && dateStr.includes("-")) {
+        const [y, m, d] = dateStr.split("-");
+        dataBR = `${d}/${m}/${y}`;
+      }
+
+      let clientMsg = "";
+
+      switch (newStatus) {
+        case "CONFIRMED":
+          clientMsg =
+            `✅ *Agendamento Confirmado!*\n\n` +
+            `Olá, ${clientName}! Seu atendimento foi confirmado:\n\n` +
+            `✂️ *Serviço:* ${serviceName}\n` +
+            `👤 *Profissional:* ${profName}\n` +
+            `📅 *Data:* ${dataBR}\n` +
+            `🕐 *Horário:* ${startTime}\n\n` +
+            `Te esperamos! 😊 — *${salonName}*`;
+          break;
+
+        case "CANCELLED":
+          clientMsg =
+            `❌ *Agendamento Cancelado*\n\n` +
+            `Olá, ${clientName}. Seu agendamento de *${serviceName}* ` +
+            `no dia *${dataBR}* às *${startTime}* foi cancelado.\n\n` +
+            `Para remarcar, entre em contato conosco. — *${salonName}*`;
+          break;
+
+        case "COMPLETED":
+          clientMsg =
+            `🌟 *Atendimento Concluído!*\n\n` +
+            `Obrigado, ${clientName}! Foi um prazer te atender hoje.\n\n` +
+            `Se gostou do serviço, conta pra um amigo! 😊\n` +
+            `— *${salonName}*`;
+          // Auto-cadastra/atualiza cliente no CRM
+          upsertCRMClient(salonId, appointment).catch(console.error);
+          break;
+
+        case "RESCHEDULED":
+          clientMsg =
+            `📅 *Agendamento Remarcado*\n\n` +
+            `Olá, ${clientName}! Seu atendimento de *${serviceName}* foi remarcado.\n\n` +
+            `📅 *Nova data:* ${dataBR}\n` +
+            `🕐 *Novo horário:* ${startTime}\n\n` +
+            `Qualquer dúvida, fale com a gente! — *${salonName}*`;
+          break;
+
+        default:
+          // Status sem notificação padrão (PENDING, AWAITING_DEPOSIT, etc.)
+          return res.json({ sent: false, reason: "status_sem_notificacao" });
+      }
+
+      let sent = false;
+
+      // Envia para o cliente se tiver telefone
+      if (clientPhone && clientMsg) {
+        sent = await sendWhatsApp(clientPhone, clientMsg, `salon_${salonId}`);
+      }
+
+      // Para CONFIRMED: notifica também o profissional (se tiver phone cadastrado)
+      if (newStatus === "CONFIRMED") {
+        const profPhone: string = appointment.professionalPhone || "";
+        if (profPhone) {
+          const profMsg =
+            `📋 *Novo agendamento confirmado!*\n\n` +
+            `👤 Cliente: *${clientName}*\n` +
+            `✂️ Serviço: *${serviceName}*\n` +
+            `📅 Data: *${dataBR}* às *${startTime}*\n\n` +
+            `Verifique sua agenda no painel. — *${salonName}*`;
+          await sendWhatsApp(profPhone, profMsg, `salon_${salonId}`);
+        }
+      }
+
+      // ── Push para o CLIENTE: notifica sobre mudança de status ──────────────
+      const pushTitles: Record<string, string> = {
+        CONFIRMED:   '✅ Agendamento Confirmado!',
+        CANCELLED:   '❌ Agendamento Cancelado',
+        COMPLETED:   '🌟 Atendimento Concluído!',
+        RESCHEDULED: '📅 Agendamento Remarcado',
+      };
+      const pushBodies: Record<string, string> = {
+        CONFIRMED:   `${serviceName} em ${dataBR} às ${startTime} — te esperamos!`,
+        CANCELLED:   `${serviceName} em ${dataBR} foi cancelado.`,
+        COMPLETED:   `Obrigado pela visita! Que tal avaliar o atendimento?`,
+        RESCHEDULED: `${serviceName} remarcado para ${dataBR} às ${startTime}`,
+      };
+
+      if (pushTitles[newStatus] && appointment.clientId && appointment.clientId !== 'guest') {
+        try {
+          await sendPushToUser(appointment.clientId, {
+            title: pushTitles[newStatus],
+            body: pushBodies[newStatus],
+            url: `/s/${salonId}/meus-agendamentos`,
+            requireInteraction: newStatus === 'CONFIRMED',
+            tag: `apt-status-${appointment.clientId}-${newStatus}`,
+          });
+        } catch (pushErr) {
+          console.error('[Push] Erro ao enviar push status cliente:', pushErr);
+        }
+      }
+
+      // ── Push para o DONO DO SALÃO: cliente cancelou ───────────────────────
+      if (newStatus === 'CANCELLED') {
+        try {
+          const salonDoc = await adminDb.collection('salons').doc(salonId).get();
+          const salonSlugForPush = salonDoc.data()?.slug || '';
+          await sendPushToSalon(salonId, {
+            title: '❌ Agendamento Cancelado',
+            body: `${clientName} cancelou ${serviceName} em ${dataBR} às ${startTime}`,
+            url: `/s/${salonSlugForPush}/admin?tab=appointments`,
+            requireInteraction: true,
+            tag: `apt-cancelled-salon-${salonId}-${Date.now()}`,
+          });
+        } catch (pushErr) {
+          console.error('[Push] Erro ao enviar push cancelamento dono:', pushErr);
+        }
+      }
+
+      console.log(`[WA Event] ${newStatus} → cliente ${clientPhone || "sem tel"} | sent=${sent}`);
+      return res.json({ sent });
+    } catch (error: any) {
+      console.error("[WA Event] Erro:", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ─── Notificação de novo agendamento (chamado pelo Booking/AdminDashboard) ──
+  app.post("/api/appointments/notify-new", async (req, res) => {
+    const { salonId, appointment } = req.body;
+    if (!salonId || !appointment) {
+      return res.status(400).json({ error: "Dados insuficientes" });
+    }
+
+    try {
+      const businessDoc = await adminDb.doc(`salons/${salonId}/settings/business`).get();
+      const business = businessDoc.data() as any;
+      const salonName = business?.name || "Seu salão";
+
+      const clientPhone: string = appointment.customerPhone || "";
+      const clientName: string  = appointment.clientName    || "Cliente";
+      const serviceName: string = appointment.serviceName   || "Serviço";
+      const profName: string    = appointment.professionalName || "";
+      const dateStr: string     = appointment.date          || "";
+      const startTime: string   = appointment.startTime     || "";
+
+      let dataBR = dateStr;
+      if (dateStr && dateStr.includes("-")) {
+        const [y, m, d] = dateStr.split("-");
+        dataBR = `${d}/${m}/${y}`;
+      }
+
+      // Confirmação para o cliente
+      if (clientPhone) {
+        const msg =
+          `📅 *Agendamento Recebido!*\n\n` +
+          `Olá, ${clientName}! Recebemos seu pedido de agendamento:\n\n` +
+          `✂️ *Serviço:* ${serviceName}\n` +
+          (profName ? `👤 *Profissional:* ${profName}\n` : "") +
+          `📅 *Data:* ${dataBR}\n` +
+          `🕐 *Horário:* ${startTime}\n\n` +
+          `Assim que for confirmado, você receberá um aviso aqui. 😊\n` +
+          `— *${salonName}*`;
+        await sendWhatsApp(clientPhone, msg, `salon_${salonId}`);
+      }
+
+      // Avisa o dono/profissional do salão
+      if (business?.whatsapp) {
+        const ownerMsg =
+          `🔔 *Novo Agendamento!*\n\n` +
+          `👤 Cliente: *${clientName}*\n` +
+          `✂️ Serviço: *${serviceName}*\n` +
+          (profName ? `💈 Profissional: *${profName}*\n` : "") +
+          `📅 Data: *${dataBR}* às *${startTime}*\n\n` +
+          `Acesse o painel para confirmar. — *${salonName}*`;
+        await sendWhatsApp(business.whatsapp, ownerMsg, `salon_${salonId}`);
+      }
+
+      // ── Push para o DONO DO SALÃO: novo agendamento chegou ─────────────────
+      try {
+        const salonDoc = await adminDb.collection('salons').doc(salonId).get();
+        const salonSlugForPush = salonDoc.data()?.slug || '';
+        await sendPushToSalon(salonId, {
+          title: '📅 Novo Agendamento!',
+          body: `${clientName} — ${serviceName} em ${dataBR} às ${startTime}`,
+          url: `/s/${salonSlugForPush}/admin?tab=appointments`,
+          requireInteraction: true,
+          tag: `new-apt-${salonId}-${Date.now()}`,
+        });
+      } catch (pushErr) {
+        console.error('[Push] Erro ao enviar push novo agendamento:', pushErr);
+      }
+
+      // ── Push para o CLIENTE: confirmação de recebimento ───────────────────
+      if (appointment.clientId && appointment.clientId !== 'guest') {
+        try {
+          await sendPushToUser(appointment.clientId, {
+            title: '📅 Agendamento Recebido!',
+            body: `${serviceName} em ${dataBR} às ${startTime} — aguardando confirmação`,
+            url: `/s/${salonId}/meus-agendamentos`,
+            tag: `apt-received-${appointment.clientId}`,
+          });
+        } catch (pushErr) {
+          console.error('[Push] Erro ao enviar push cliente:', pushErr);
+        }
+      }
+
+      return res.json({ sent: true });
+    } catch (error: any) {
+      console.error("[WA New Appointment] Erro:", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ─── Notificação de novo pedido para o dono da loja ────────────────────────
+  app.post("/api/order/notify-owner", async (req, res) => {
+    const { salonId, orderId, order } = req.body;
+    if (!salonId) return res.status(400).json({ error: "Dados faltando" });
+    try {
+      const salonDoc = await adminDb.collection("salons").doc(salonId).get();
+      const salon = salonDoc.data() as any;
+      const ownerDoc = await adminDb.collection("users").doc(salon?.ownerId).get();
+      const owner = ownerDoc.data() as any;
+      const businessDoc = await adminDb.doc(`salons/${salonId}/settings/business`).get();
+      const business = businessDoc.data() as any;
+      const ownerWhatsapp = business?.whatsapp || "";
+
+      const paymentLabels: Record<string, string> = {
+        PIX: "PIX", CASH: "Dinheiro na entrega", CARD_MACHINE: "Cartão (maquininha)",
+        ON_SITE: "Pagar no local/retirada",
+      };
+      const payLabel = paymentLabels[order?.paymentMethod || ""] || order?.paymentMethod || "—";
+      const isReserve = order?.paymentMethod === "ON_SITE";
+
+      if (ownerWhatsapp) {
+        const msg =
+          `🛍️ *${isReserve ? "Nova reserva" : "Novo pedido"}!*\n\n` +
+          `👤 ${order?.customerName}\n` +
+          `📱 ${order?.customerPhone || "—"}\n` +
+          `💳 Pagamento: ${payLabel}\n` +
+          (order?.cardBrand ? `🃏 Bandeira: ${order.cardBrand}\n` : "") +
+          (order?.orderNote ? `📝 Obs: ${order.orderNote}\n` : "") +
+          (order?.changeFor ? `💵 Troco para: R$ ${order.changeFor}\n` : "") +
+          `🚚 Entrega: ${order?.shippingMethod === "PICKUP" ? "Retirada no salão" : "Entrega"}\n` +
+          `💰 Total: R$ ${Number(order?.totalAmount || 0).toFixed(2)}\n\n` +
+          (isReserve ? `⚠️ Separe o item! Confirme o pagamento no painel quando o cliente pagar.` : `✅ Pedido confirmado.`);
+        await sendWhatsApp(ownerWhatsapp, msg, `salon_${salonId}`);
+      }
+
+      if (owner?.email) {
+        await sendEmail({
+          to: owner.email,
+          subject: `🛍️ ${isReserve ? "Nova reserva" : "Novo pedido"} — ${order?.customerName}`,
+          html: `<div style="font-family:sans-serif;max-width:500px;margin:0 auto;padding:20px;">
+            <h2 style="color:#e11d48;">${isReserve ? "Nova reserva!" : "Novo pedido!"}</h2>
+            <p><strong>Cliente:</strong> ${order?.customerName}<br>
+            <strong>Telefone:</strong> ${order?.customerPhone || "—"}<br>
+            <strong>Pagamento:</strong> ${payLabel}<br>
+            <strong>Total:</strong> R$ ${Number(order?.totalAmount || 0).toFixed(2)}</p>
+            ${isReserve ? '<p style="color:#f97316;"><strong>⚠️ Separe o item e aguarde o cliente confirmar o pagamento no painel.</strong></p>' : ""}
+          </div>`,
+        });
+      }
+      // Push notification para o dono
+      await sendPushToSalon(salonId, {
+        title: isReserve ? '🛍️ Nova reserva!' : '🛍️ Novo pedido!',
+        body: `${order?.customerName} — R$ ${Number(order?.totalAmount || 0).toFixed(2)} — ${payLabel}`,
+        url: `/s/${salonSlug}/admin?tab=store`,
+        requireInteraction: true,
+      });
+
+      return res.json({ sent: true });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ─── Sistema de Afiliados ───────────────────────────────────────────────────
+
+  // Configuração de descontos (centralizados aqui)
+  const REFERRAL = {
+    salon:    { newUserDiscount: 15, discountPerReferral: 15, maxDiscount: 50 },
+    marketer: { newUserDiscount: 20, marketerCommission: 30 },
+  };
+
+  // Registra signup vindo de um link de afiliado
+  app.post("/api/affiliate/register-signup", async (req, res) => {
+    const { affiliateSlug, newSalonId, ownerEmail } = req.body;
+    if (!affiliateSlug || !newSalonId) return res.json({ ok: false });
+
+    try {
+      // Descobre se é salão ou marketeiro
+      const [salonSnap, marketerSnap] = await Promise.all([
+        adminDb.collection("salons").where("slug", "==", affiliateSlug).limit(1).get(),
+        adminDb.collection("affiliates").doc(affiliateSlug).get(),
+      ]);
+
+      const isSalon    = !salonSnap.empty;
+      const isMarketer = marketerSnap.exists && !isSalon;
+
+      // Salva o ref no documento do novo salão (para aplicar desconto no 1º pagamento)
+      const newSalonSnap = await adminDb.collection("salons").where("slug", "==", newSalonId).limit(1).get();
+      if (!newSalonSnap.empty) {
+        const newSalonRef = newSalonSnap.docs[0].ref;
+        await newSalonRef.update({
+          affiliateRef: affiliateSlug,
+          affiliateType: isSalon ? "salon" : "marketer",
+          affiliateDiscountPct: isSalon ? REFERRAL.salon.newUserDiscount : REFERRAL.marketer.newUserDiscount,
+          affiliateDiscountApplied: false,
+          referredAt: Date.now(),
+        });
+      }
+
+      // Incrementa cliques/conversões no registro de afiliado
+      if (isMarketer) {
+        await marketerSnap.ref.update({
+          conversions: FieldValue.increment(1),
+          pendingCommissions: FieldValue.increment(1),
+        });
+      }
+
+      console.log(`[Affiliate] Signup via ${isSalon ? "salon" : "marketer"} ref: ${affiliateSlug} → ${newSalonId}`);
+      return res.json({ ok: true, type: isSalon ? "salon" : "marketer" });
+    } catch (e: any) {
+      console.error("[Affiliate] register-signup error:", e);
+      return res.json({ ok: false });
+    }
+  });
+
+  // Retorna o desconto pendente para um salão (usado antes do checkout Stripe)
+  app.get("/api/affiliate/discount/:salonId", authenticateUser, async (req, res) => {
+    const { salonId } = req.params;
+    try {
+      const salonDoc = await adminDb.collection("salons").doc(salonId).get();
+      const salon = salonDoc.data() as any;
+
+      // Desconto por ser indicado (1º pagamento)
+      let newUserDiscount = 0;
+      if (salon?.affiliateRef && !salon?.affiliateDiscountApplied) {
+        newUserDiscount = salon.affiliateDiscountPct || 0;
+      }
+
+      // Desconto acumulado por ter indicado outros salões (10% por indicação, max 50%)
+      const referralCredits = salon?.referralCredits || 0;
+      const referralDiscount = Math.min(referralCredits * REFERRAL.salon.discountPerReferral, REFERRAL.salon.maxDiscount);
+
+      // Usa o maior desconto disponível
+      const totalDiscount = Math.max(newUserDiscount, referralDiscount);
+
+      return res.json({
+        newUserDiscount,
+        referralDiscount,
+        totalDiscount,
+        referralCredits,
+        affiliateType: salon?.affiliateType || null,
+        affiliateRef: salon?.affiliateRef || null,
+      });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // SuperAdmin: lista todos os afiliados (marketeiros + salões indicadores) com comissões pendentes
+  app.get("/api/affiliate/report", authenticateUser, async (req, res) => {
+    const user = (req as any).user;
+    const userDoc = await adminDb.collection("users").doc(user.uid).get();
+    if (userDoc.data()?.role !== "SUPER_ADMIN") return res.status(403).json({ error: "Unauthorized" });
+
+    try {
+      // Marketeiros
+      const marketersSnap = await adminDb.collection("affiliates").orderBy("conversions", "desc").get();
+      const marketers = marketersSnap.docs.map(d => ({ id: d.id, ...d.data(), type: "marketer" }));
+
+      // Salões com créditos de indicação
+      const salonsSnap = await adminDb.collection("salons").where("referralCredits", ">", 0).get();
+      const referringSalons = salonsSnap.docs.map(d => ({
+        id: d.id, ...d.data(), type: "salon",
+        discount: Math.min((d.data().referralCredits || 0) * 10, 50),
+      }));
+
+      // Salões que foram indicados mas ainda não pagaram (desconto pendente)
+      const pendingSnap = await adminDb.collection("salons")
+        .where("affiliateDiscountApplied", "==", false)
+        .get();
+      const pendingDiscounts = pendingSnap.docs
+        .filter(d => d.data().affiliateRef)
+        .map(d => ({ id: d.id, ...d.data() }));
+
+      return res.json({ marketers, referringSalons, pendingDiscounts });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Marca comissão do marketeiro como paga (SuperAdmin)
+  app.post("/api/affiliate/pay-commission", authenticateUser, async (req, res) => {
+    const { affiliateSlug, amount, note } = req.body;
+    const user = (req as any).user;
+    const userDoc = await adminDb.collection("users").doc(user.uid).get();
+    if (userDoc.data()?.role !== "SUPER_ADMIN") return res.status(403).json({ error: "Unauthorized" });
+
+    try {
+      await adminDb.collection("affiliates").doc(affiliateSlug).update({
+        pendingCommissions: FieldValue.increment(-1),
+        totalPaid: FieldValue.increment(amount || 0),
+        lastPaymentAt: Date.now(),
+        lastPaymentNote: note || "",
+      });
+      return res.json({ ok: true });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ─── Email de boas-vindas ao cadastrar salão ─────────────────────────────
+  // ─── Indicação de clientes (client referral) ─────────────────────────────────
+  // Chamado quando um cliente agenda e veio de um link de indicação (?ref=CODE)
+  app.post("/api/client-referral/register", express.json(), async (req, res) => {
+    const { salonId, referralCode, newClientName, newClientId } = req.body;
+    if (!salonId || !referralCode) return res.status(400).json({ error: "salonId e referralCode obrigatórios" });
+
+    try {
+      // Descobre o clientId que gerou esse código (os 8 primeiros chars do uid em maiúsculo)
+      const clientsSnap = await adminDb.collection(`salons/${salonId}/client_referrals`).get();
+      let referrerDoc: any = null;
+
+      for (const d of clientsSnap.docs) {
+        const data = d.data();
+        if (data.referralCode === referralCode) {
+          referrerDoc = d;
+          break;
+        }
+      }
+
+      if (!referrerDoc) return res.status(404).json({ error: "Código de indicação não encontrado" });
+
+      const referrerData = referrerDoc.data();
+
+      // Evita indicar a si mesmo
+      if (referrerData.clientId === newClientId) {
+        return res.status(400).json({ error: "Não pode usar seu próprio link" });
+      }
+
+      // Verifica se esse cliente já foi indicado antes pelo mesmo referrer
+      const alreadyReferred = (referrerData.referrals || []).some((r: any) => r.clientId === newClientId);
+      if (alreadyReferred) return res.json({ ok: true, message: "Já registrado" });
+
+      const POINTS_PER_REFERRAL = 50;
+      const newReferrals = [
+        ...(referrerData.referrals || []),
+        { clientId: newClientId, name: newClientName || 'Amigo', date: Date.now() },
+      ];
+
+      await referrerDoc.ref.update({
+        totalReferrals: (referrerData.totalReferrals || 0) + 1,
+        earnedPoints:   (referrerData.earnedPoints || 0) + POINTS_PER_REFERRAL,
+        referrals:      newReferrals,
+        updatedAt:      Date.now(),
+      });
+
+      // Adiciona pontos de fidelidade ao referrer
+      const loyaltyRef = adminDb.doc(`salons/${salonId}/loyalty_accounts/${referrerData.clientId}`);
+      const loyaltySnap = await loyaltyRef.get();
+      if (loyaltySnap.exists()) {
+        await loyaltyRef.update({ points: FieldValue.increment(POINTS_PER_REFERRAL), updatedAt: Date.now() });
+      }
+
+      console.log(`[Referral] ${referrerData.clientName} ganhou ${POINTS_PER_REFERRAL} pts por indicar ${newClientName} (${salonId})`);
+      return res.json({ ok: true, pointsEarned: POINTS_PER_REFERRAL });
+    } catch (e: any) {
+      console.error("[Referral]", e);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ─── WhatsApp Webhook (Evolution API → Bot) ──────────────────────────────────
+  app.post("/api/whatsapp/webhook", express.json(), async (req, res) => {
+    try {
+      const body = req.body;
+
+      // Evolution manda eventos de vários tipos — só processa mensagens de texto recebidas
+      const event = body?.event || body?.type || '';
+      if (!event.toLowerCase().includes('message') && !event.toLowerCase().includes('received')) {
+        return res.json({ ok: true });
+      }
+
+      const data = body?.data || body;
+      const messageType = data?.messageType || data?.message?.type || '';
+      if (messageType !== 'conversation' && messageType !== 'extendedTextMessage' && !data?.message?.conversation) {
+        return res.json({ ok: true }); // ignora mídia, sticker, etc
+      }
+
+      // Extrai o texto e remetente
+      const text: string = (
+        data?.message?.conversation ||
+        data?.message?.extendedTextMessage?.text ||
+        data?.text || ''
+      ).trim();
+
+      const from: string = (
+        data?.key?.remoteJid ||
+        data?.remoteJid ||
+        data?.from || ''
+      ).replace('@s.whatsapp.net', '').replace('@c.us', '');
+
+      // Ignora mensagens próprias (enviadas pelo bot)
+      const fromMe = data?.key?.fromMe ?? data?.fromMe ?? false;
+      if (fromMe || !from || !text) return res.json({ ok: true });
+
+      // Descobre o salonId a partir da instância
+      const instanceName: string = (
+        body?.instance ||
+        body?.instanceName ||
+        data?.instanceName || ''
+      );
+
+      const salonId = instanceName.startsWith('salon_')
+        ? instanceName.replace('salon_', '')
+        : null;
+
+      if (!salonId) return res.json({ ok: true });
+
+      // Busca o plano do salão para decidir qual bot usar
+      const salonDoc = await adminDb.collection('salons').doc(salonId).get();
+      if (!salonDoc.exists) return res.json({ ok: true });
+
+      const salonData = salonDoc.data() as any;
+      const planDoc = salonData?.planId
+        ? await adminDb.collection('plans').doc(salonData.planId).get()
+        : null;
+      const planFeatures = planDoc?.data()?.features || {};
+
+      // Bot inteligente: planos com hasWhatsAppIntegration ou hasCRM avançado (Completo/AgendaPro)
+      const useSmartBot = !!planFeatures.hasWhatsAppIntegration;
+
+      let reply = '';
+      if (useSmartBot) {
+        reply = await handleSmartBot(salonId, from, text);
+      } else {
+        reply = await handleSimpleBot(salonId, from, text);
+      }
+
+      if (reply) {
+        await sendWhatsApp(from, reply, instanceName);
+      }
+
+      return res.json({ ok: true });
+    } catch (e: any) {
+      console.error('[Webhook]', e);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ─── Registra webhook na Evolution quando instância conecta ──────────────────
+  app.post("/api/whatsapp/register-webhook", authenticateUser, express.json(), async (req, res) => {
+    const { salonId } = req.body;
+    if (!salonId || !EVOLUTION_URL || !EVOLUTION_API_KEY) {
+      return res.status(400).json({ error: "Dados insuficientes ou Evolution não configurada" });
+    }
+    const instanceName = `salon_${salonId}`;
+    const APP_URL = process.env.APP_URL || `http://localhost:${process.env.PORT || 3066}`;
+    const webhookUrl = `${APP_URL}/api/whatsapp/webhook`;
+
+    try {
+      const r = await fetch(`${EVOLUTION_URL}/webhook/set/${instanceName}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_API_KEY },
+        body: JSON.stringify({
+          url: webhookUrl,
+          enabled: true,
+          events: ['MESSAGES_UPSERT'],
+        }),
+      });
+      const d = await r.json();
+      console.log(`[Webhook Register] ${instanceName} → ${webhookUrl}`, d);
+      return res.json({ ok: true, data: d });
+    } catch (e: any) {
+      console.error('[Webhook Register]', e);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+      app.post("/api/salon/welcome-email", express.json(), async (req, res) => {
+    const { salonName, slug, ownerEmail, ownerName } = req.body;
+    if (!ownerEmail) return res.status(400).json({ error: "ownerEmail obrigatório" });
+    try {
+      await sendEmail({
+        to: ownerEmail,
+        subject: `Bem-vindo(a) à plataforma, ${ownerName || salonName}!`,
+        html: `
+          <div style="font-family: sans-serif; max-width: 500px; margin: 0 auto;">
+            <h2>🎉 Seu salão foi criado com sucesso!</h2>
+            <p>Olá, <strong>${ownerName || 'Administrador'}</strong>!</p>
+            <p>O salão <strong>${salonName}</strong> já está ativo na plataforma.</p>
+            <p>Acesse seu painel e configure tudo do jeito que você quer:</p>
+            <a href="${APP_URL}/s/${slug}/admin"
+               style="display:inline-block;padding:12px 24px;background:#e11d48;color:#fff;border-radius:8px;text-decoration:none;font-weight:bold;">
+              Acessar Painel
+            </a>
+            <p style="margin-top:24px;font-size:12px;color:#666;">
+              Se precisar de ajuda, responda este email.
+            </p>
+          </div>
+        `,
+      });
+      return res.json({ success: true });
+    } catch (error: any) {
+      console.error("[welcome-email]", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ─── Vite / Static ───────────────────────────────────────────────────────
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath, {
+      setHeaders: (res, filePath) => {
+        if (filePath.endsWith('.html')) {
+          res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        } else if (filePath.endsWith('.js')) {
+          res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        } else if (filePath.endsWith('.css')) {
+          res.setHeader('Content-Type', 'text/css; charset=utf-8');
+        }
+      }
+    }));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+      });
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+startServer().catch(console.error);
