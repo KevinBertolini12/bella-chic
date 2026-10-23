@@ -39,8 +39,8 @@ npm install
 
 # Iniciar o servidor de desenvolvimento
 npm run dev
+```
 
 
-
-👤 Autor
+👤 Autor:
 Desenvolvido por Kevin Bertolini
